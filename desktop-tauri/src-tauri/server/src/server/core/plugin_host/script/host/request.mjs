@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
 
-export function pluginHeaders(headers, params, body) {
+export function pluginHeaders(headers, params, body, provider = {}) {
   const source = new Headers(params.headers || {})
-  if (params.session) headers.set("x-magpie-session", params.session)
+  if (params.session) headers.set("x-magpie-session", signatureScope(provider, params))
   const subagent = source.get("x-claude-code-agent-id")
   if (subagent) headers.set("x-magpie-subagent", subagent)
   if (params.fallback === true) headers.set("x-magpie-fallback", "1")
@@ -17,9 +17,9 @@ export function pluginHeaders(headers, params, body) {
 }
 
 export function signatureScope(provider, params) {
-  const headers = params.headers || {}
+  const headers = new Headers(params.headers || {})
   return createHash("sha256").update(JSON.stringify([provider.id, params.account, params.session || "",
-    headers.authorization || headers["x-api-key"] || ""])).digest("hex")
+    headers.get("authorization") || headers.get("x-api-key") || ""])).digest("hex")
 }
 
 export function variantOptions(protocol, model, level, body) {

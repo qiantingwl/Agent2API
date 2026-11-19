@@ -50,6 +50,7 @@ pub async fn get_config(State(_state): State<ServerState>) -> Response {
         "apiKeySet": snapshot.api_key_set(),
         "locale": snapshot.locale(),
         "defaultModel": snapshot.default_model(),
+        "quickPlaceholder": config::quick_placeholder::current(),
         // 指纹脱敏开关（与 GET /api/sanitize 同一个键、同一个值）
         config::KEY_SANITIZE_FINGERPRINTS: snapshot.sanitize_fingerprints(),
     }))
@@ -67,6 +68,13 @@ pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Resp
     };
     let Some(object) = payload.as_object() else {
         return errors::management_error(400, "请求体必须是 JSON 对象");
+    };
+    let placeholder = match object.get(config::quick_placeholder::KEY) {
+        Some(value) => match config::quick_placeholder::validate(value) {
+            Ok(settings) => Some(settings),
+            Err(message) => return errors::management_error(400, message),
+        },
+        None => None,
     };
 
     // ── apiKey ──────────────────────────────────────────────
@@ -108,8 +116,14 @@ pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Resp
         }
     }
 
+    if let Some(settings) = placeholder {
+        if let Err(message) = config::quick_placeholder::save(settings) {
+            return errors::management_error(500, message);
+        }
+    }
     let snapshot = config::current();
     ok_json(json!({
+        "quickPlaceholder": config::quick_placeholder::current(),
         "apiKeySet": snapshot.api_key_set(),
         "locale": snapshot.locale(),
         "defaultModel": snapshot.default_model(),

@@ -19,7 +19,7 @@ impl Activity {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.paused || state.retired { return None; }
         state.users += 1;
-        Some(Arc::new(UsageLease { activity: self.clone() }))
+        Some(Arc::new(UsageLease { activity: self.clone(), _maintenance: None }))
     }
 
     pub fn pause(self: &Arc<Self>) -> Option<PauseGuard> {
@@ -40,6 +40,16 @@ impl Activity {
 
 pub(super) struct UsageLease {
     activity: Arc<Activity>,
+    _maintenance: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl UsageLease {
+    pub fn with_maintenance(self: &Arc<Self>, guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>) -> Arc<Self> {
+        if guard.is_none() { return self.clone(); }
+        let mut state = self.activity.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.users += 1;
+        Arc::new(Self { activity: self.activity.clone(), _maintenance: guard })
+    }
 }
 
 impl Drop for UsageLease {

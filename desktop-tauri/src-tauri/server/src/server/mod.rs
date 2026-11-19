@@ -403,6 +403,8 @@ impl ServerState {
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
+        core::subscriptions::install(db.clone());
+        core::sub_kernel::spawn_worker();
         core::proxy_settings::install(db.clone());
         // 先装云同步设置；自动同步须等账号迁移完成后启动，不能上传半份启动状态。
         core::cloud_sync::install(db.clone());
@@ -487,6 +489,8 @@ impl ServerState {
         // 的其余部分（日志、模型目录、健康检查、配置页）不依赖账号，让它们继续
         // 可用比整体拒绝启动更有用 —— 用户能在界面上看到那条 ❌ 日志并处理磁盘问题。
         let store = AccountStore::with_db(db.clone());
+        core::sub_kernel::install_store(Some(store.clone()));
+        if core::subscriptions::should_autostart() { core::sub_kernel::request_restart(core::subscriptions::enabled_provider_inputs()); }
         // 插件家的登录回调要把账号落库，而那条链路拿不到 ServerState（它是
         // trait 方法，签名里只有一个插件不用的 &AccountStore）。装一个进程级
         // 句柄，见 `account_store::plugin_accounts::shared`。

@@ -494,6 +494,7 @@ impl AccountStore {
         };
         match shaped {
             Value::Object(mut fields) => {
+                super::plugin_public::wps_recovery_fields(record, &mut fields);
                 for key in ["rateLimits", "routingCooldowns", "upstreamCooldownUntil", "upstreamBlockedReason"] {
                     if let Some(value) = record.get(key) { fields.insert(key.to_string(), value.clone()); }
                     else { fields.remove(key); }

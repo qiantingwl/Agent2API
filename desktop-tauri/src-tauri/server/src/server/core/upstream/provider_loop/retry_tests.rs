@@ -180,6 +180,11 @@ async fn send(
     degraded: bool,
     image: Option<ImageResponseKind>,
 ) -> Result<super::super::images::ImageResponse, OutboundFailure> {
+    // Keep the current unified rules, with no wall-clock backoff or global
+    // configuration dependency in these transport-loop tests.
+    let mut policy = config::error_policy::ErrorPolicySnapshot::default();
+    policy.settings.interval_seconds = 0;
+    budget.policy = Arc::new(policy);
     tokio::time::timeout(
         Duration::from_secs(5),
         send_with_retry(
@@ -241,7 +246,7 @@ async fn successful_response_does_not_spend_retry_budget() {
 
 #[tokio::test]
 async fn a_transient_failure_can_retry_and_then_succeed() {
-    let upstream = upstream(vec![ERROR, SUCCESS]).await;
+    let upstream = upstream(vec![(503, ERROR.1, ERROR.2), SUCCESS]).await;
     let mut budget = RetryBudget::new(3);
     let telemetry = telemetry();
     let adapter = TestAdapter {
@@ -257,12 +262,12 @@ async fn a_transient_failure_can_retry_and_then_succeed() {
     assert_eq!(budget.remaining, 2);
     let snapshot = telemetry.snapshot();
     assert_eq!(snapshot.attempts_detail[0].retries.len(), 1);
-    assert_eq!(snapshot.attempts_detail[0].retries[0].status, Some(409));
+    assert_eq!(snapshot.attempts_detail[0].retries[0].status, Some(503));
 }
 
 #[tokio::test]
 async fn retry_limit_is_initial_send_plus_budget_and_is_shared_across_calls() {
-    let upstream = upstream(vec![ERROR]).await;
+    let upstream = upstream(vec![(503, ERROR.1, ERROR.2)]).await;
     let mut budget = RetryBudget::new(2);
     let adapter = TestAdapter {
         retry: true,
@@ -270,7 +275,7 @@ async fn retry_limit_is_initial_send_plus_budget_and_is_shared_across_calls() {
     };
     let telemetry = telemetry();
     let error = failure(send(&adapter, &upstream, &mut budget, &telemetry, false, None).await);
-    assert_eq!(error.error.status_code, 409);
+    assert_eq!(error.error.status_code, 503);
     assert_eq!(error.error.upstream_code, Some(123));
     assert_eq!(upstream.hits.load(Ordering::SeqCst), 3);
     assert_eq!(budget.remaining, 0);
@@ -328,7 +333,7 @@ async fn deterministic_and_account_errors_are_not_resent_in_place() {
 }
 
 #[tokio::test]
-async fn provider_stop_and_suspension_override_retry_advice() {
+async fn provider_retry_stop_and_suspension_prevent_resends() {
     for adapter in [
         TestAdapter {
             retry: true,
@@ -341,24 +346,36 @@ async fn provider_stop_and_suspension_override_retry_advice() {
             ..Default::default()
         },
     ] {
-        let upstream = upstream(vec![ERROR]).await;
+        let upstream = upstream(vec![(503, ERROR.1, ERROR.2)]).await;
         let mut budget = RetryBudget::new(3);
         let error =
             failure(send(&adapter, &upstream, &mut budget, &telemetry(), false, None).await);
-        assert!(error.stop || error.policy.suspend_account);
+        assert_eq!(error.error.status_code, 503);
+        assert_eq!(error.policy.suspend_account, adapter.suspend);
         assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
         assert_eq!(budget.remaining, 3);
     }
 }
 
 #[tokio::test]
-async fn content_blocking_only_retries_after_the_degraded_attempt() {
+async fn unknown_conflict_does_not_retry_on_adapter_advice_alone() {
+    let upstream = upstream(vec![ERROR]).await;
+    let mut budget = RetryBudget::new(3);
+    let adapter = TestAdapter { retry: true, ..Default::default() };
+    let error = failure(send(&adapter, &upstream, &mut budget, &telemetry(), false, None).await);
+    assert_eq!(error.error.status_code, 409);
+    assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.remaining, 3);
+}
+
+#[tokio::test]
+async fn content_blocking_is_not_resent_even_after_degradation() {
     let adapter = TestAdapter {
         retry: true,
         content_blocked: true,
         ..Default::default()
     };
-    for (degraded, expected) in [(false, 1), (true, 3)] {
+    for (degraded, expected) in [(false, 1), (true, 1)] {
         let upstream = upstream(vec![(400, ERROR.1, ERROR.2)]).await;
         let mut budget = RetryBudget::new(2);
         let error = failure(
@@ -377,6 +394,7 @@ async fn content_blocking_only_retries_after_the_degraded_attempt() {
             UpstreamErrorClass::ContentBlocked { .. }
         ));
         assert_eq!(upstream.hits.load(Ordering::SeqCst), expected);
+        assert_eq!(budget.remaining, 2);
     }
 }
 
@@ -418,7 +436,7 @@ async fn uncertain_image_failure_is_not_resent_even_with_retry_advice() {
         .await,
     );
     assert!(error.stop);
-    assert!(error.error.message.contains("未自动重试"));
+    assert!(error.error.routing_error.as_ref().is_some_and(|decision| decision.hard_stop));
     assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
     assert_eq!(budget.remaining, 3);
 }

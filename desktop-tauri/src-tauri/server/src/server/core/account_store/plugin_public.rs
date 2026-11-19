@@ -9,6 +9,29 @@ const REFRESH_EXPIRY_KEYS: &[&str] = &[
     "refreshTokenExpiresAt", "refreshExpiresAt", "refresh_expires_at", "refresh_token_expires_at",
 ];
 
+pub(super) fn wps_recovery_fields(record: &StoredAccount, public: &mut Map<String, Value>) {
+    public.remove("wpsRecovery");
+    if record.provider() != "wps-lingxi" { return; }
+    use sha2::{Digest, Sha256};
+    let digest = |value: &Value| format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap_or_default()));
+    let auth = record.get("pluginSecret").unwrap_or(&Value::Null);
+    // Same ordered nullable fields as the script host's credential() function.
+    let stamp = digest(&serde_json::json!([auth.pointer("/metadata/cookie"), auth.get("cookie"),
+        auth.get("key"), auth.get("access"), auth.pointer("/metadata/sid")]));
+    let identity_key = format!("pluginLedger.wpsRecovery.{}", &digest(&Value::String("*".into()))[..32]);
+    let identity = record.get(&identity_key).filter(|gate| gate["blocked"] == true)
+        .is_some_and(|gate| gate["reason"] == "verification" || gate["credential"].as_str() == Some(&stamp));
+    let mut models = Vec::new();
+    for (key, gate) in record.fields() {
+        if !key.starts_with("pluginLedger.wpsRecovery.") || key == &identity_key || gate["blocked"] != true { continue; }
+        let Some(model) = gate["model"].as_str() else { continue; };
+        let model = crate::server::core::routing::wps_model_key(model);
+        let expected = format!("pluginLedger.wpsRecovery.{}", &digest(&Value::String(model.clone()))[..32]);
+        if key == &expected { models.push(Value::String(model)); }
+    }
+    public.insert("wpsRecovery".into(), serde_json::json!({"identityBlocked":identity,"blockedModels":models}));
+}
+
 pub(super) fn credential_fields(record: &StoredAccount, public: &mut Map<String, Value>) {
     if record.is_desktop() && matches!(record.provider().as_str(),
         "raccoon" | "kiro" | "autoclaw" | "autoclaw-intl" | "cline-free" | "cline-pass")

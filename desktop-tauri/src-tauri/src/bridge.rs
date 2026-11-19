@@ -473,6 +473,18 @@ const BRIDGE_JS: &str = r#"
     // 面板的桥）：只加一边时，另一形态下的页面会报「桥接方法缺失」——
     // 标题栏那一族方法有同样的教训，见 zcode-claim 那段的说明。
     // 写操作返回最新代理列表；测试失败以 success:false 表达。
+    getSubscriptions: () => call('GET', '/api/subscriptions'),
+    addSubscription: payload => call('POST', '/api/subscriptions/add', payload || {}),
+    saveSubscription: payload => call('POST', '/api/subscriptions/save', payload || {}),
+    refreshSubscription: id => call('POST', '/api/subscriptions/refresh', { id: String(id || '') }),
+    removeSubscription: id => call('POST', '/api/subscriptions/remove', { id: String(id || '') }),
+    decodeQrImage: payload => call('POST', '/api/subscriptions/decode-qr', payload || {}),
+    getKernelStatus: () => call('GET', '/api/subscriptions/kernel'),
+    downloadKernel: payload => call('POST', '/api/subscriptions/kernel/download', payload || {}),
+    cancelKernelDownload: () => call('POST', '/api/subscriptions/kernel/download/cancel', {}),
+    restartKernel: () => call('POST', '/api/subscriptions/kernel/restart', {}),
+    stopKernel: () => call('POST', '/api/subscriptions/kernel/stop', {}),
+    removeKernel: () => call('POST', '/api/subscriptions/kernel/remove', {}),
     getProxyPool: () => call('GET', '/api/proxies/pool'),
     createProxyPoolItem: payload => call('POST', '/api/proxies/pool', payload || {}),
     updateProxyPoolItem: payload => call('POST', '/api/proxies/pool/update', payload || {}),

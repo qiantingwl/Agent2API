@@ -534,6 +534,25 @@ pub async fn test_connectivity(
     timeout_ms: u64,
     target_url: Option<&str>,
 ) -> ConnectivityResult {
+    test_connectivity_inner(proxy, timeout_ms, target_url, true).await
+}
+
+/// A site probe measures the target only. An unrelated IP lookup must not
+/// consume its deadline or turn an already successful response into a timeout.
+pub async fn test_site_connectivity(
+    proxy: Option<&ResolvedProxy>,
+    timeout_ms: u64,
+    target_url: &str,
+) -> ConnectivityResult {
+    test_connectivity_inner(proxy, timeout_ms, Some(target_url), false).await
+}
+
+async fn test_connectivity_inner(
+    proxy: Option<&ResolvedProxy>,
+    timeout_ms: u64,
+    target_url: Option<&str>,
+    lookup_ip: bool,
+) -> ConnectivityResult {
     let started = logging::now_ms();
     let url = target_url.unwrap_or(DEFAULT_TEST_URL);
     let transport = match proxy.map(crate::server::core::proxies::chain::endpoint).transpose() {
@@ -556,7 +575,7 @@ pub async fn test_connectivity(
             let duration_ms = logging::now_ms() - started;
             drop(response);
             let success = status.is_success();
-            let ip = if success {
+            let ip = if success && lookup_ip {
                 read_exit_ip(&client, proxy, timeout_ms.min(IP_LOOKUP_MAX_MS)).await
             } else {
                 String::new()
@@ -640,5 +659,37 @@ pub fn describe_public(proxy: Option<&ResolvedProxy>) -> Value {
             "port": proxy.port_json(),
             "nonDirect": proxy.non_direct,
         }),
+    }
+}
+
+#[cfg(test)]
+mod site_probe_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn site_probe_only_contacts_target_through_selected_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy_task = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let size = connection.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.starts_with("GET http://probe.invalid/health "));
+            connection.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+            drop(connection);
+            // An IP lookup would create a second CONNECT request here. The
+            // test proxy never forwards traffic to the external network.
+            tokio::time::timeout(Duration::from_millis(250), listener.accept()).await.is_ok()
+        });
+        let proxy = ResolvedProxy { source: "custom".into(), protocol: "http".into(),
+            host: "127.0.0.1".into(), port: Some(port), username: String::new(),
+            password: String::new(), label: "local probe test".into(), non_direct: false };
+        let result = test_site_connectivity(Some(&proxy), 1_000, "http://probe.invalid/health").await;
+        assert!(result.success);
+        assert_eq!(result.status, Some(204));
+        assert!(result.ip.is_empty());
+        assert!(!proxy_task.await.unwrap(), "site probe unexpectedly performed an IP lookup");
     }
 }

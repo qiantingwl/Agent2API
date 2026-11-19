@@ -502,7 +502,8 @@ pub(super) fn scoped_accounts(
     pinned: Option<&str>,
     request_routing: Option<&super::route_context::RequestRouting>,
 ) -> Vec<Value> {
-    let accounts = accounts_in_providers(service, providers, pinned);
+    let accounts = accounts_in_providers(service, providers, pinned).into_iter()
+        .filter(|account| !routing::login_unavailable(account)).collect();
     let accounts = if pinned.is_some() && !request_routing.is_some_and(|routing| routing.strict_vision) { accounts } else if let Some(request_routing) = request_routing {
         request_routing.accounts(accounts)
     } else {

@@ -87,6 +87,44 @@ pub struct UpstreamErrorDetail {
     pub payload: Option<Value>,
 }
 
+#[cfg(test)]
+mod failure_recovery_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn response(bytes: &'static [u8]) -> reqwest::Response {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket,_)=listener.accept().await.unwrap();
+            let mut buffer=[0u8;4096];let _=socket.read(&mut buffer).await;
+            socket.write_all(bytes).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}/synthetic")).send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_403_and_failed_error_body_are_distinct() {
+        let empty=response(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let detail=read_upstream_error(empty,None).await;
+        assert_eq!(detail.message,"上游 HTTP 403 返回空错误响应体");
+        let broken=response(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort").await;
+        let detail=read_upstream_error(broken,None).await;
+        assert!(detail.message.contains("错误响应体读取失败"));
+        assert!(!detail.message.contains("short"));
+    }
+
+    #[tokio::test]
+    async fn valid_error_business_code_and_message_are_preserved() {
+        let good=response(b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n{\"code\":200003,\"message\":\"synthetic-auth\"}").await;
+        let detail=read_upstream_error(good,None).await;
+        assert_eq!(detail.code,Some(200003));
+        assert_eq!(detail.to_value()["message"],"synthetic-auth");
+    }
+}
+
 impl UpstreamErrorDetail {
     /// 适配器入参形态：`{code, message}`（键名与上游 JSON 一致，
     /// 于是适配器可以直接用 `error_body.get("code")` 读，不需要中间结构体）
@@ -112,13 +150,26 @@ pub async fn read_upstream_error(
     if let Some(capture) = capture {
         capture.attach_response(response.status().as_u16(), response.headers());
     }
-    let text = response.text().await.unwrap_or_default();
+    let status = response.status().as_u16();
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(error) => {
+            // 不把读取失败吞成“上游没有说明”，也不记录请求内容或完整响应。
+            let kind = if error.is_timeout() { "超时" }
+                else if error.is_decode() { "解码失败" }
+                else { "连接或响应体中断" };
+            return UpstreamErrorDetail { code: None, payload: None,
+                message: format!("上游 HTTP {status} 错误响应体读取失败（{kind}）") };
+        }
+    };
     if let Some(capture) = capture {
         capture.push(text.as_bytes());
     }
     let mut code = None;
     let mut parsed = None;
-    let mut message = if capture.is_some() {
+    let mut message = if text.trim().is_empty() {
+        format!("上游 HTTP {status} 返回空错误响应体")
+    } else if capture.is_some() {
         text.clone()
     } else {
         text.chars().take(500).collect()

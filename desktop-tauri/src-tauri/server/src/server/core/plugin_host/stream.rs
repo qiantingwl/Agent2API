@@ -143,12 +143,13 @@ impl UsageSniffer {
             self.done |= complete;
             return;
         }
-        if ![b"usage".as_slice(), b"error".as_slice()]
+        if ![b"usage".as_slice(), b"error".as_slice(), b"choices".as_slice()]
             .iter().any(|field| self.data.windows(field.len()).any(|window| window == *field))
         {
             return;
         }
         let Ok(chunk) = serde_json::from_slice::<Value>(&self.data) else { return };
+        if complete && !self.done { telemetry.note_effective_output(&chunk); }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
             telemetry.report_usage(usage);
         }
@@ -424,7 +425,7 @@ impl RpcStream {
         self.capture_failure(failure);
     }
 
-    /// 排上「错误帧 + [DONE]」收尾。
+    /// 有边界检查的流以错误结束，不伪造正常终帧。
     fn finish_with_error(&mut self, message: &str) {
         self.close_conversation();
         self.usage.finish(&self.telemetry);
@@ -441,6 +442,12 @@ impl RpcStream {
             self.ended = true;
             self.workbuddy_synthetic = !self.usage.done;
             self.start_settlement();
+            return;
+        }
+        // The original error frame has already been forwarded and classified.
+        // Preserve its status and avoid appending a second generic error.
+        if self.failure.is_some() && self.usage.failure.is_some() {
+            self.ended = true;
             return;
         }
         self.capture_failure(GatewayError::with_status(502, message).with_code("runtime_stream_interrupted"));

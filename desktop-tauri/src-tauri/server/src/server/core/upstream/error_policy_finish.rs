@@ -16,7 +16,7 @@ pub(super) fn finish_failure(service: &UpstreamService, ctx: &ProviderContext<'_
     let decision = error.routing_error.clone().unwrap_or_else(|| error_policy::for_error_with(&ctx.error_policy, &target.provider, &model, error, false));
     error_policy::attach(error, &decision);
     error_policy::note(ctx.telemetry, &decision, None);
-    if decision.hard_stop || ctx.telemetry.replay_guard().blocked() || ctx.telemetry.is_cancelled() || ctx.telemetry.response_started() { return false; }
+    if decision.hard_stop || ctx.telemetry.replay_guard().blocked() || ctx.telemetry.is_cancelled() || ctx.telemetry.response_started_for(&target.provider) { return false; }
     if let Some(account) = target.account_id.as_deref() {
         if let Some(entry) = error_policy::remember_cooldown(service, settings, account, &model, error, &decision) {
             let reset = entry["resetAt"].as_i64().unwrap_or(0);

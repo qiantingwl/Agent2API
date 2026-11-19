@@ -10,6 +10,10 @@ export type ProxyPoolItem = ProxyUsage & {
   name: string
   source: string
   enabled: boolean
+  providerId?: string
+  providerName?: string
+  node?: string
+  orphan?: boolean
   sourceEnabled?: boolean
   localDisabled?: boolean
   listenerUid?: string
@@ -53,8 +57,10 @@ export type ProxyTestResult = {
 }
 
 export type ProxySettings = {
+  listenerPortBase?: number
+  listenerPortEnd?: number
   testUrl?: string
-  defaults?: { testUrl?: string }
+  defaults?: { testUrl?: string; listenerPortBase?: number; listenerPortEnd?: number }
 }
 
 /* ─── 桥（只声明本页用到的成员；不 declare global，理由见 accounts-shared）─── */

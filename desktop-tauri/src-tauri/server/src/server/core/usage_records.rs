@@ -213,7 +213,13 @@ pub fn mark_attempt(account_id: &str) {
 /// 内存事实表同步更新：成功且有数字 → 刷新；成功但判不出（unlimited / 形状不认）
 /// → 摘除（不能让一个过期的旧数字把账号永久挡在选路之外）。
 pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str, request_id: &str) -> bool {
-    let now = logging::now_ms();
+    write_result_at(account_id, outcome, query_config, request_id, logging::now_ms())
+}
+
+/// External observations retain their original timestamp; serialize DB and memory publication.
+pub fn write_result_at(account_id: &str, outcome: &UsageOutcome, query_config: &str, request_id: &str, now: i64) -> bool {
+    static WRITES: Mutex<()> = Mutex::new(());
+    let _write = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(db) = database() else { return false };
     // 闭包返回 `(是否成功, 成功时提出的数字)`：失败分支只写原因、保留旧数值
     // （SQL 里就不碰 usage / remaining / last_success 三列），事实表按它更新。
@@ -239,10 +245,11 @@ pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str
                        last_attempt_at = excluded.last_attempt_at,
                        updated_at = excluded.updated_at,
                        query_config = excluded.query_config,
-                       query_request_id = excluded.query_request_id",
+                       query_request_id = excluded.query_request_id
+                       WHERE account_usage_records.last_attempt_at <= excluded.last_attempt_at",
                     params![account_id, usage_text, remaining, unlimited as i64, now, query_config, request_id],
                 )
-                .ok()?;
+                .ok().filter(|n| *n > 0)?;
                 Some((true, remaining))
             }
             None => {
@@ -259,10 +266,11 @@ pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str
                        last_attempt_at = excluded.last_attempt_at,
                        updated_at = excluded.updated_at,
                        query_request_id = excluded.query_request_id,
-                       diagnostics = excluded.diagnostics",
+                       diagnostics = excluded.diagnostics
+                       WHERE account_usage_records.last_attempt_at <= excluded.last_attempt_at",
                     params![account_id, error, outcome.code, now, request_id, diagnostics],
                 )
-                .ok()?;
+                .ok().filter(|n| *n > 0)?;
                 Some((false, None))
             }
         }

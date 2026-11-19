@@ -81,6 +81,35 @@ pub async fn chat_completions(
     key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
     body: Bytes,
 ) -> Response {
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    let streaming = parsed.as_ref().is_some_and(|value| value.is_object()
+        && value.get("stream") == Some(&Value::Bool(true))
+        && value.get("messages").is_some_and(Value::is_array));
+    let placeholder = crate::server::config::quick_placeholder::current();
+    if streaming && placeholder.enabled {
+        let model = parsed.as_ref().and_then(|value| value.get("model"))
+            .and_then(Value::as_str).unwrap_or("gateway").to_string();
+        // API-key authentication has already completed in the router middleware.
+        // Model/route failures after acknowledgement remain explicit SSE errors.
+        return super::quick_placeholder::respond(model, crate::server::config::quick_placeholder::delay(placeholder),
+            chat_completions_inner(State(state),headers,key_scope,key_identity,key_source,body)).await;
+    }
+    chat_completions_inner(State(state),headers,key_scope,key_identity,key_source,body).await
+}
+
+async fn chat_completions_inner(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    // R9：中间件放进请求扩展的「命中 Key 的限制」。`Option` 是刻意的 ——
+    // 免鉴权模式、环境变量 Key、转发链路之外的管理调用都没有它，
+    // 而「取不到 = 不限制」正是本需求的语义（见 `core::key_scope` 模块头）。
+    // axum 对 `Option<Extension<T>>` 有专门实现：取不到就是 `None`，不会像
+    // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
+    key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
+    key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
+    key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
+    body: Bytes,
+) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
     // 请求开始时刻（请求统计用）。放在最前面：它要覆盖 body 解析与选路的耗时
     let started_at = logging::now_ms();

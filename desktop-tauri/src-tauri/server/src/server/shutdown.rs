@@ -225,6 +225,7 @@ impl Shared {
     }
 
     pub(super) fn request_shutdown(&self) {
+        core::sub_kernel::shutdown();
         self.request_shutdown_until(Instant::now() + SHUTDOWN_TIMEOUT);
     }
 

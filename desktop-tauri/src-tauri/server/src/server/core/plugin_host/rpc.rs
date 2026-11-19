@@ -301,10 +301,13 @@ impl RpcAdapter {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, GatewayError> {
+        let account_guard = crate::server::core::external_lease::native(self.id,
+            params.get("account").and_then(Value::as_str).unwrap_or("")).await?;
         // 每次调用都先 ensure：崩溃之后第一次调用会重新拉起子进程。
         let execution = self.execution().await?;
         let lease = execution.lease.clone().or_else(|| execution.host.activity.acquire())
             .ok_or_else(|| super::activity::AvailabilityError::Unavailable.gateway())?;
+        let lease = lease.with_maintenance(account_guard);
         execution.host
             .ensure()
             .await
@@ -1104,7 +1107,11 @@ impl ProviderAdapter for RpcAdapter {
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let value = if matches!(self.id, "codearts" | "cline-free") && self.metadata().host.options.wasm.is_some() {
+            let expected = if self.id == "raccoon" {
+                crate::server::core::blocking::in_place(|| _store.plugin_account(account_id))
+                    .and_then(|account| account.get("secret").cloned())
+            } else { None };
+            let result = async { Ok::<Value, GatewayError>(if matches!(self.id, "codearts" | "cline-free") && self.metadata().host.options.wasm.is_some() {
                 let execution = self.execution().await?;
                 super::rpc_refresh::readiness(_store, self.id, account_id).await?;
                 let params = self.with_account(account_id);
@@ -1116,7 +1123,15 @@ impl ProviderAdapter for RpcAdapter {
                 result.map_err(|error| rpc_error(self.id, error, proto::methods::gateway::TOKEN_REFRESH))?
             } else {
                 self.network(proto::methods::gateway::TOKEN_REFRESH, self.with_account(account_id)).await?
-            };
+            }) }.await;
+            if let (Some(expected), Err(error)) = (expected.as_ref(), &result) {
+                // 401 是插件明确的不可续期结果；网络失败/502/超时不标永久失效。
+                if error.status_code == 401 {
+                    let _ = crate::server::core::blocking::in_place(||
+                        _store.plugin_mark_relogin_if_current(account_id, expected));
+                }
+            }
+            let value = result?;
             value
                 .as_str()
                 .map(str::to_string)
@@ -1264,6 +1279,7 @@ impl ProviderAdapter for RpcAdapter {
     > {
         Box::pin(async move {
             super::wasm::catalog::ensure(self, account_id, body["model"].as_str().unwrap_or("")).await?;
+            let account_guard = crate::server::core::external_lease::native(self.id, account_id).await?;
             let execution = self.execution().await?;
             let prepared_tools = if execution.web_tool_emulation {
                 crate::server::core::upstream::web_tools::prepare(body, &execution.list_models())?
@@ -1278,6 +1294,7 @@ impl ProviderAdapter for RpcAdapter {
             let host = execution.host.clone();
             let lease = execution.lease.clone().or_else(|| host.activity.acquire())
                 .ok_or_else(|| super::activity::AvailabilityError::Unavailable.gateway())?;
+            let lease = lease.with_maintenance(account_guard);
             let workbuddy_failure = if self.id == "workbuddy" && host.options.wasm.is_some() {
                 Some(super::stream::workbuddy::Owner::prepare(store, account_id,
                     body["model"].as_str().unwrap_or(""), telemetry.clone()).await)
@@ -2191,7 +2208,7 @@ impl RpcAdapter {
         }
         if let Some(owner) = &conversation { owner.select_output()?; }
         let strict = strict::applies(self.id);
-        let bounded = strict || self.host.options.wasm.is_some() || tool_context.is_some();
+        let bounded = strict || self.host.options.wasm.is_some() || self.id == "wps-lingxi" || tool_context.is_some();
         let failure = bounded.then(|| Arc::new(std::sync::Mutex::new(None)));
         let private_failure = strict.then(|| Arc::new(std::sync::Mutex::new(None)));
         let source = super::RpcStream::with_pending(
@@ -2273,7 +2290,9 @@ impl RpcAdapter {
                     }
                     let class = self.classify_error_async(status, &detail).await;
                     let mut classified = conversation_error(status, class, &detail);
-                    classified.code = Some("plugin_response_started".into());
+                    if self.id != "wps-lingxi" || telemetry.response_started_for(self.id) {
+                        classified.code = Some("plugin_response_started".into());
+                    }
                     return Err(classified);
                 }
                 let private = private_failure.and_then(|slot| {

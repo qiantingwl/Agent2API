@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::context::Context;
-use super::super::{self as host, install::{InstalledPack, PackRegistry}};
+use crate::server::core::plugin_host as host;
+use host::install::{InstalledPack, PackRegistry};
 use crate::server::config;
 
 pub(crate) const CAPABILITY: &str = "http.account-origin.v1";

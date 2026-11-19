@@ -20,7 +20,7 @@ pub fn pool_reference_id(proxy: &Value) -> Option<&str> {
 }
 
 pub fn service_references() -> Vec<(&'static str, String)> {
-    [("update", config::update_proxy())]
+    [("update", config::update_proxy()), ("kernel", config::kernel_proxy())]
     .into_iter()
     .filter_map(|(service, proxy)| {
         let proxy = proxy?;

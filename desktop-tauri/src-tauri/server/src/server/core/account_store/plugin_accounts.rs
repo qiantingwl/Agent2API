@@ -19,6 +19,38 @@ const PUBLIC_KEY: &str = "pluginPublic";
 /// 台账键的前缀：`pluginLedger.<kind>`。
 const LEDGER_PREFIX: &str = "pluginLedger.";
 
+#[cfg(test)]
+mod failure_recovery_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn failed_refresh_and_relogin_use_same_credential_and_keep_switch() {
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("failure-recovery");
+        let store = AccountStore::with_db(Some(db));
+        let old = json!({"token":"synthetic-old"});
+        let new = json!({"token":"synthetic-new"});
+        let record = StoredAccount::from_map(json!({"id":"synthetic-account", "provider":"raccoon",
+            "enabled":true,"priority":1,"pluginSecret":old}).as_object().unwrap().clone());
+        {
+            let guard=store.guard();
+            store.with_conn(&guard, |conn| super::super::sql::put(conn,&record)).unwrap();
+        }
+        assert!(store.plugin_mark_relogin_if_current("synthetic-account",&old).unwrap());
+        assert!(store.needs_relogin("synthetic-account"));
+        assert_eq!(store.read_record("synthetic-account").unwrap().get("enabled"),Some(&Value::Bool(true)));
+        // A no-op credential delivery must not claim to recover invalid credentials.
+        assert!(store.plugin_update_secret("synthetic-account",&old,&old).unwrap());
+        assert!(store.needs_relogin("synthetic-account"));
+        assert!(store.plugin_update_secret("synthetic-account",&old,&new).unwrap());
+        assert!(!store.needs_relogin("synthetic-account"));
+        // A late failure for the previous credential cannot spoil a fresh login.
+        assert!(!store.plugin_mark_relogin_if_current("synthetic-account",&old).unwrap());
+        assert!(!store.needs_relogin("synthetic-account"));
+        assert_eq!(store.read_record("synthetic-account").unwrap().get("enabled"),Some(&Value::Bool(true)));
+    }
+}
+
 /// 网关骨架键：这些**不进**摊平后的 secret（它们是记录的元数据，不是凭证）。
 ///
 /// ── 为什么需要这张表 ────────────────────────────────────────
@@ -94,7 +126,7 @@ fn flatten_builtin_secret(record: &StoredAccount) -> Value {
 const MIRROR_KEYS: [&str; 3] = ["accessToken", "refreshToken", "expiresAt"];
 
 /// 这条记录的插件 secret（`pluginSecret` 优先，否则摊平内置字段）。
-pub(super) fn secret_of(record: &StoredAccount) -> Value {
+pub(crate) fn secret_of(record: &StoredAccount) -> Value {
     let mut secret = match record.get(SECRET_KEY) {
         Some(value) if !value.is_null() => value.clone(),
         _ => flatten_builtin_secret(record),
@@ -421,6 +453,19 @@ impl AccountStore {
     /// ── 内置存量记录：写 `pluginSecret`，并镜像令牌键回顶层 ──────────
     /// 镜像只为「卸载插件后还能用」（见 [`MIRROR_KEYS`]）；只镜像记录顶层
     /// **本来就有**的那几个，不凭空造内置形态。
+    pub fn plugin_mark_relogin_if_current(&self, id: &str, expect: &Value) -> Result<bool, String> {
+        let guard = self.guard();
+        let Some(mut record) = self.record_by_id(&guard, id) else { return Ok(false) };
+        if record.provider() != "raccoon" || &secret_of(&record) != expect { return Ok(false); }
+        if record.get("needsRelogin").and_then(Value::as_bool) == Some(true) { return Ok(true); }
+        record.set("needsRelogin", Value::Bool(true));
+        record.set("needsReloginReason", Value::String("登录凭证被拒绝且续期返回401，需要重新登录".into()));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| crate::server::core::account_store::sql::update_in_place(conn, &record))
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     pub fn plugin_update_secret(
         &self,
         id: &str,
@@ -449,6 +494,11 @@ impl AccountStore {
                 return Ok(Ok(false));
             }
             record.set(SECRET_KEY, secret.clone());
+            // 新凭证回写只解除这两个提供方旧凭证的登录标记；不改账户开关。
+            if matches!(record.provider().as_str(), "loomy" | "raccoon") && &current != secret {
+                record.remove("needsRelogin");
+                record.remove("needsReloginReason");
+            }
             if let Some(public) = public.filter(|value| value.is_object()) {
                 record.set(PUBLIC_KEY, public.clone());
                 if record.get("pluginIdentityContract").and_then(Value::as_u64) == Some(1)

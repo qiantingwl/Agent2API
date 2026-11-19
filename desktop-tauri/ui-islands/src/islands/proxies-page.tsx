@@ -20,24 +20,14 @@ import { COL_CLASS, closeColumnPanel, repaintColumnWidths, setupColumns, visible
 import { TableFooter, useClientPaging } from './table-shell'
 import { t } from '../i18n'
 import { proxyServiceLabels } from '../../../ui-shared/proxy-usage'
-import { shouldShowProxyRetirement } from '../../../ui-shared/proxy-retirement'
-import { ProxyRetirementDialog } from '../../../ui-shared/proxy-retirement-dialog'
+import { KernelBar, SubscriptionManagerDialog } from './proxies-sub-view'
+import { loadSection } from './proxies-sub-state'
 
-let noticeRevision = 0
-const noticeListeners = new Set<() => void>()
-function enteredPage(): void {
-  if (!shouldShowProxyRetirement()) return
-  noticeRevision += 1
-  noticeListeners.forEach(listener => listener())
-}
+function enteredPage(): void { void loadSection() }
 
 function ProxiesPage() {
   const snapshot = React.useSyncExternalStore(subscribe, getSnapshot)
-  const notice = React.useSyncExternalStore(listener => {
-    noticeListeners.add(listener)
-    return () => { noticeListeners.delete(listener) }
-  }, () => noticeRevision)
-  const [noticeOpen, setNoticeOpen] = React.useState(false)
+  const [subscriptionsOpen, setSubscriptionsOpen] = React.useState(false)
   const [modal, setModal] = React.useState<{ item: ProxyPoolItem | null } | null>(null)
   const [settingsOpen, setSettingsOpen] = React.useState(false)
   const [filterOpen, setFilterOpen] = React.useState(false)
@@ -62,7 +52,6 @@ function ProxiesPage() {
   const paging = useClientPaging(shown.length, 'proxies')
   const pageRows = paging.paged ? paging.slice(shown) : shown
 
-  React.useEffect(() => { if (notice > 0) setNoticeOpen(true) }, [notice])
   React.useEffect(() => { paging.goto(1) }, [query, protocol, status])
   React.useLayoutEffect(() => {
     if (!setupColumns(() => forceTick())) {
@@ -91,7 +80,9 @@ function ProxiesPage() {
           <span className='flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-foreground'>
             <span className='shrink-0 font-mono'>{(item.resolved?.protocol || item.protocol || 'http').toUpperCase()}</span>
             <span className='opacity-45' aria-hidden='true'>·</span>
-            {item.source === 'clash'
+            {item.source === 'subscription'
+              ? <span className='truncate' title={item.node}>{item.providerName || t('订阅节点')}</span>
+              : item.source === 'clash'
               ? <span className='truncate' title={t('只读：在 Clash Verge 里改')}>Clash Verge</span>
               : <span className='truncate'>{t('手动添加')}</span>}
             {item.nonDirect ? <>
@@ -134,8 +125,10 @@ function ProxiesPage() {
         </div>
       }
       case 'state':
-        return <Switch checked={item.enabled !== false} disabled={locked || item.source === 'clash' && item.sourceEnabled === false}
-          title={item.source === 'clash'
+        return <Switch checked={item.enabled !== false} disabled={locked || (item.source === 'clash' || item.source === 'subscription') && item.sourceEnabled === false}
+          title={item.source === 'subscription'
+            ? t('启停订阅节点；仅为正在使用的节点分配监听端口')
+            : item.source === 'clash'
             ? item.sourceEnabled === false ? t('这条在 Clash Verge 里是停用的，本页启用不生效 —— 到 Clash Verge 里打开它')
               : t('禁用后本端不再用它（引用它的账号回退直连）；端口在 Clash Verge 侧，不受影响')
             : undefined}
@@ -168,12 +161,12 @@ function ProxiesPage() {
         /* 「测试」压在最右边：整列右对齐，于是它永远贴着表格右缘 ——
            次要操作（只读提示 / 编辑 / 删除）留在它左边，安静但不消失 */
         return <div className='row-actions'>
-          {item.source === 'clash'
+          {(item.source === 'clash' || item.source === 'subscription' && !item.orphan)
             ? <span className='self-center text-[10.5px] text-muted-foreground'
-              title={t('名字与端口在 Clash Verge 里改；启用可在本页关闭')}>{t('只读')}</span>
+              title={item.source === 'subscription' ? t('节点由订阅管理维护') : t('名字与端口在 Clash Verge 里改；启用可在本页关闭')}>{t('只读')}</span>
             : <>
-              <Button size='icon-xs' variant='ghost' disabled={locked} title={t('编辑')} aria-label={t('编辑')}
-                onClick={() => setModal({ item })}><EditIcon /></Button>
+              {!item.orphan ? <Button size='icon-xs' variant='ghost' disabled={locked} title={t('编辑')} aria-label={t('编辑')}
+                onClick={() => setModal({ item })}><EditIcon /></Button> : null}
               <Button size='icon-xs' variant='ghost' disabled={locked} title={t('删除')} aria-label={t('删除')}
                 className='text-muted-foreground hover:text-destructive'
                 onClick={() => void removeItem(item)}><TrashIcon /></Button>
@@ -185,6 +178,7 @@ function ProxiesPage() {
   }
 
   return <>
+    <KernelBar />
     <Card render={<section />} className='panel'>
       <CardHeader className='panel-head'>
         <h2>{t('代理列表')}</h2><Badge variant='secondary' shape='tag'>{rows.length}</Badge>
@@ -194,6 +188,7 @@ function ProxiesPage() {
               （同步是第二条常用动作，保留描边；测试设置与刷新是轻动作，走 ghost） */}
           <Button disabled={locked} onClick={() => setModal({ item: null })}>{t('＋ 新增代理')}</Button>
           <Button variant='ghost' className='hidden max-[767px]:inline-flex' onClick={() => setFilterOpen(true)}>{t('筛选')}</Button>
+          <Button variant='outline' onClick={() => setSubscriptionsOpen(true)}>{t('订阅管理')}</Button>
           <Button variant='outline' disabled={locked} onClick={() => void syncClash()}>{snapshot.syncing ? t('同步中…') : t('同步 Clash Verge')}</Button>
           <Button variant='ghost' disabled={locked} onClick={() => setSettingsOpen(true)}>{t('测试设置')}</Button>
           <Button variant='ghost' disabled={snapshot.loading || locked} onClick={() => void loadPanel()}>{snapshot.loading ? t('刷新中…') : t('刷新')}</Button>
@@ -249,7 +244,7 @@ function ProxiesPage() {
     </Card>
     {modal ? <ProxyModal item={modal.item} onClose={() => setModal(null)} /> : null}
     {settingsOpen ? <ProxySettingsModal onClose={() => setSettingsOpen(false)} /> : null}
-    <ProxyRetirementDialog open={noticeOpen} onClose={() => setNoticeOpen(false)} t={t} />
+    {subscriptionsOpen ? <SubscriptionManagerDialog onClose={() => setSubscriptionsOpen(false)} /> : null}
   </>
 }
 

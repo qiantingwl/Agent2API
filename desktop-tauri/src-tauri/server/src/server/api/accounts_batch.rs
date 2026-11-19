@@ -91,6 +91,9 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
 
     match result {
         Ok(value) => {
+            if matches!(action.as_str(), "proxy" | "remove") {
+                super::proxies::reconcile_listeners(state);
+            }
             // 响应带上 action，与 Node 版 `{ action, ...result, list }` 一致
             let mut merged = Map::new();
             merged.insert("action".to_string(), Value::String(action));

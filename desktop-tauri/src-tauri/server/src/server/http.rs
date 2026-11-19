@@ -74,10 +74,6 @@ const CORS_HEADERS: &str =
 ///
 /// 分端口部署（headless 设了 `AGENT2API_PANEL_PORT`）时不要用本函数：
 /// 用 [`panel_router`] + [`gateway_router`] 各挂一个监听（见 `mod::start`）。
-async fn retired_proxy_feature() -> Response {
-    errors::management_error(410, crate::server::core::proxy_pool::RETIRED_HINT)
-}
-
 async fn retired_provider_login() -> Response {
     errors::management_error(410, "请从添加账号页面选择当前提供商声明的登录方式；旧版默认登录入口已停止支持。")
 }
@@ -490,6 +486,18 @@ pub fn panel_router(state: ServerState) -> Router {
         // → 落到全局 404 兜底，与 Node 版「前缀判定不通过 → 全局兜底」一致。
         // pool 各条都是固定路径（id 走 body / query，不用 {id} 段 ——
         // 理由见 api::proxies 的模块头），方法判定在 proxies_entry 里。
+        .route("/api/subscriptions", any(api::subscriptions::entry))
+        .route("/api/subscriptions/add", any(api::subscriptions::entry))
+        .route("/api/subscriptions/save", any(api::subscriptions::entry))
+        .route("/api/subscriptions/refresh", any(api::subscriptions::entry))
+        .route("/api/subscriptions/remove", any(api::subscriptions::entry))
+        .route("/api/subscriptions/decode-qr", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/download", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/download/cancel", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/restart", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/stop", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/remove", any(api::subscriptions::entry))
         .route("/api/proxies", any(api::accounts::proxies_entry))
         .route("/api/proxies/system", any(api::accounts::proxies_entry))
         .route("/api/proxies/test", any(api::accounts::proxies_entry))
@@ -500,9 +508,6 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
         .route("/api/proxies/settings", any(api::accounts::proxies_entry))
-        // ── 已下线的订阅入口只返回状态，不再读取请求体或执行内核操作 ──
-        .route("/api/subscriptions", any(retired_proxy_feature))
-        .route("/api/subscriptions/{*rest}", any(retired_proxy_feature))
         // ── 积分 / 签到 / 运营活动（对照 server.mjs 871-911 行）──
         // 六条都挂在 protected（Node 版每条都调了 checkApiKey），
         // 失败时的 body 是 OpenAI 风格（那几条在 server.mjs 的大 try 里）
@@ -909,6 +914,10 @@ pub fn panel_router(state: ServerState) -> Router {
         // 「已注册路径 + 未注册方法」变成 405 兜底，而这个前缀下希望统一给 404。
         // 单独登记尾斜杠形态：`/api/scheduled-tasks/` 在 `{*rest}` 里匹配不上
         // （通配要求至少一个非空段），不登记就会落到全局 404。
+        .route("/api/external-maintenance/apply", post(api::external_maintenance::apply))
+        .route("/api/external-maintenance/inflight", get(api::external_maintenance::inflight))
+        .route("/api/external-maintenance/lease", post(api::external_maintenance::lease))
+        .route("/api/external-maintenance/wps-recheck", post(api::external_maintenance::wps_recheck))
         .route("/api/maintenance", get(api::maintenance::overview))
         .route("/api/maintenance/{*rest}", any(api::maintenance::entry))
         .route("/api/scheduled-tasks", any(api::scheduled_tasks::entry))
@@ -1463,6 +1472,17 @@ mod cors_tests {
     use axum::routing::post;
     use tower::ServiceExt;
 
+    #[test]
+    fn restored_subscription_routes_build_without_collision() {
+        crate::test_support::isolated(concat!(module_path!(), "::restored_subscription_routes_build_without_collision"), || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            runtime.block_on(async {
+                let state = ServerState::bootstrap(0, "127.0.0.1".parse().unwrap()).unwrap();
+                let _router = router(state);
+            });
+        });
+    }
+
     /// 与 `gateway_router` 网关面同构的最小路由：业务处理恒返回 200，
     /// 只用来观察 `cors_gateway` 在预检与普通请求上的行为。
     fn probe_router() -> Router {
@@ -1493,6 +1513,7 @@ mod cors_tests {
     #[test]
     fn gateway_cors_follows_switch() {
         crate::test_support::isolated(concat!(module_path!(), "::gateway_cors_follows_switch"), || {
+            crate::server::config::init(None);
             crate::test_support::runtime().block_on(gateway_cors_cases());
         });
     }

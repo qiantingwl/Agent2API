@@ -10,6 +10,7 @@ const PROVIDER: &str = "officeace";
 const IMPORT_BUDGET: Duration = Duration::from_secs(45);
 
 pub(super) async fn complete(state: &ServerState, ids: &[String], result: &mut Value) {
+    super::proxies::reconcile_listeners(state);
     let deadline = tokio::time::Instant::now() + IMPORT_BUDGET;
     let mut seen = HashSet::new();
     let mut reports = Vec::new();

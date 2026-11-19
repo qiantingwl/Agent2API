@@ -186,6 +186,7 @@ async fn dispatch(
                 // 绕开失败冷却的口子，见下面 clear_check_cooldown 的说明）
                 let changed = config::update_proxy() != normalized;
                 let saved = config::set_update_proxy(normalized);
+                super::proxies::reconcile_listeners(state);
                 if changed {
                     state.update().clear_check_cooldown();
                     state.update().reset_policy_cache();

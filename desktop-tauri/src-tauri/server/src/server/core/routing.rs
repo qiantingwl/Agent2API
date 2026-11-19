@@ -169,11 +169,58 @@ pub fn rate_limit_reset_at(account: &Value, keys: &CooldownKeys<'_>, now: i64) -
 
 /// 账号是否可用于转发：启用 + 未被该模型限额。
 /// `reason` ∈ `Some("disabled")` | `Some("rate-limited")` | `None`（可用）。
+pub fn login_unavailable(account: &Value) -> bool {
+    matches!(account.get("provider").and_then(Value::as_str), Some("loomy" | "raccoon"))
+        && account.get("needsRelogin").and_then(Value::as_bool) == Some(true)
+}
+
+fn balance_pending(account: &Value) -> bool {
+    account.get("provider").and_then(Value::as_str) == Some("loomy")
+        && account.get("upstreamBlockedReason").and_then(Value::as_str) == Some("余额待核验：上游返回402")
+}
+
+pub(crate) fn wps_model_key(model: &str) -> String {
+    model.rsplit_once('@').filter(|(_, suffix)| !suffix.is_empty()).map_or(model, |(base, _)| base).to_lowercase()
+}
+
+fn wps_unavailable(account: &Value, keys: &CooldownKeys<'_>) -> bool {
+    if provider_of(account) != "wps-lingxi" { return false; }
+    let Some(gate) = account.get("wpsRecovery") else { return false; };
+    if gate["identityBlocked"] == true { return true; }
+    let model = wps_model_key(&keys.for_account(account));
+    !model.is_empty() && gate["blockedModels"].as_array().is_some_and(|models|
+        models.iter().any(|blocked| blocked.as_str() == Some(model.as_str())))
+}
+
+#[cfg(test)]
+mod verification_gate_tests {
+    use super::*;
+    #[test]
+    fn loomy_waits_for_receipt_after_timer_expires() {
+        let mut record=serde_json::json!({"provider":"loomy","upstreamBlockedReason":"余额待核验：上游返回402","upstreamCooldownUntil":1});
+        assert!(balance_pending(&record));
+        record["provider"]="raccoon".into();
+        assert!(!balance_pending(&record));
+        record["provider"]="loomy".into();
+        record.as_object_mut().unwrap().remove("upstreamBlockedReason");
+        assert!(!balance_pending(&record));
+    }
+}
+
 pub fn account_usability(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> AccountUsability {
     // Node: `account?.enabled === false` —— 只有显式 false 才算禁用，
     // 缺失/字符串 "false"/0 都视为启用（与 account-store 的 enabled() 同口径）
     if matches!(account.get("enabled"), Some(Value::Bool(false))) {
         return AccountUsability { usable: false, reason: Some("disabled") };
+    }
+    if login_unavailable(account) {
+        return AccountUsability { usable: false, reason: Some("needs-relogin") };
+    }
+    if balance_pending(account) {
+        return AccountUsability { usable: false, reason: Some("balance-pending") };
+    }
+    if wps_unavailable(account, keys) {
+        return AccountUsability { usable: false, reason: Some("model-unavailable") };
     }
     if is_rate_limited(account, keys, now) {
         return AccountUsability { usable: false, reason: Some("rate-limited") };
@@ -653,6 +700,18 @@ pub fn plan_route(
         }
         if matches!(account.get("enabled"), Some(Value::Bool(false))) {
             blocked.push(entry("disabled", "已禁用，不参与转发".to_string()));
+            continue;
+        }
+        if login_unavailable(account) {
+            blocked.push(entry("needs-relogin", "登录失效，等待当前凭证核验成功".to_string()));
+            continue;
+        }
+        if balance_pending(account) {
+            blocked.push(entry("cooldown", "上游返回402，等待余额核验；账户开关未关闭".to_string()));
+            continue;
+        }
+        if wps_unavailable(account, keys) {
+            blocked.push(entry("model-unavailable", "WPS 登录或模型等待独立核验；未消耗转发换号次数".to_string()));
             continue;
         }
         if meta.limiter_blocked.contains(&candidate_id) {
@@ -1161,3 +1220,19 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod closure_tests {
+    use super::*;
+    #[test]
+    fn loomy_login_gate_preserves_switch_and_other_providers() {
+        let a = serde_json::json!({"provider":"loomy","enabled":true,"needsRelogin":true});
+        assert!(login_unavailable(&a));
+        assert_eq!(a["enabled"], true);
+        let r=serde_json::json!({"provider":"raccoon","enabled":true,"needsRelogin":true});
+        assert!(login_unavailable(&r));
+        assert_eq!(r["enabled"],true);
+        assert!(!login_unavailable(&serde_json::json!({"provider":"loomy","needsRelogin":false})));
+        assert!(!login_unavailable(&serde_json::json!({"provider":"codearts","needsRelogin":true})));
+    }
+}

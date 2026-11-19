@@ -1564,6 +1564,7 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             changes.extend(balance_changes);
             crate::server::core::usage_query::refresh_configuration(state.store());
             // 改代理成功后对账：新引用的补监听器、旧引用失去的回收端口
+            super::proxies::reconcile_listeners(state);
             ok_json(json!({
                 "account": account,
                 "changes": changes,
@@ -1696,6 +1697,7 @@ pub fn delete_account(state: &ServerState, id: &str) -> Response {
     // （最后一个引用消失 → 这个节点的监听器该收了）
     match state.store().remove_account(id) {
         Ok(()) => {
+            super::proxies::reconcile_listeners(state);
             ok_json(json!({ "list": state.store().list_visible_accounts() }))
         }
         Err(error) => store_error(error),

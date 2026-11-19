@@ -86,6 +86,7 @@ fn script_files() -> &'static [(&'static str, &'static str)] {
         ("login-network.mjs", include_str!("host/login-network.mjs")),
         ("models.mjs", include_str!("host/models.mjs")),
         ("provider.mjs", include_str!("host/provider.mjs")),
+        ("wps-recovery.mjs", include_str!("host/wps-recovery.mjs")),
         ("gemini.mjs", include_str!("host/gemini.mjs")),
         ("request.mjs", include_str!("host/request.mjs")),
         ("errors.mjs", include_str!("host/errors.mjs")),

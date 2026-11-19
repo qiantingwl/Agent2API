@@ -17,6 +17,32 @@ import { compatibleUsageResult } from "./usage-policy.mjs"
 import { isLocalProvider, localAddress, localErrorPolicy, localRequest } from "./local-provider.mjs"
 import { checkLocalProxy } from "./local-process.mjs"
 
+import { WpsRecovery, WpsErrorFrames } from './wps-recovery.mjs'
+const wpsRecovery = new WpsRecovery(rpc, getAuth)
+
+async function recoverWps(provider, params, call) {
+  const model = params.payload?.model
+  await restoreModels(provider)
+  const release = await acquire(provider)
+  try {
+    return await wpsRecovery.recover(provider, params.account, model, async () => {
+      const options = await authOptions(provider, providerInfo(provider))
+      if (typeof options.fetch !== 'function') throw unsupported('WPS plugin fetch is unavailable')
+      const signal = AbortSignal.any([call.signal, AbortSignal.timeout(30_000)])
+      const fetching = options.fetch('https://lingxi.wps.cn/api/chat/completions', {
+        method:'POST', signal, headers:{'content-type':'application/json'},
+        body:JSON.stringify({model,stream:false,max_tokens:32,messages:[{role:'user',content:'请只回答：正常。'}]}),
+      })
+      void Promise.resolve(fetching).then(response => {
+        if (signal.aborted) void response?.body?.cancel().catch(()=>{})
+      },()=>{})
+      const response = await untilCancelled(fetching, signal)
+      try { return response.ok ? await untilCancelled(response.json(),signal) : null }
+      finally { await response.body?.cancel().catch(()=>{}) }
+    }, params.payload?.expect)
+  } finally { release() }
+}
+
 export { safeMessage }
 
 function unsupported(message = "Plugin does not provide this capability") {
@@ -31,6 +57,7 @@ async function conversation(provider, params, call) {
   const modelID = params.wire_model || params.body?.model
   if (!modelID) throw new Error("Model is required")
   const model = await modelForRequest(provider, modelID)
+  await wpsRecovery.check(provider, params.account, modelID, auth)
   await checkAllowance(modelID)
   const protocol = protocolOf(provider, model)
   const info = providerInfo(provider)
@@ -61,7 +88,7 @@ async function conversation(provider, params, call) {
   for (const source of [options.headers, model.headers]) {
     for (const [name, value] of Object.entries(source ?? {})) headers.set(name, String(value))
   }
-  pluginHeaders(headers, params, source)
+  pluginHeaders(headers, params, source, provider)
   const sessionID = params.session || ""
   const input = { sessionID, agent: "build", model: { ...model, id: modelID, providerID: provider.originalID || provider.id },
     provider: { source: "custom", info, options }, message: { id: "", sessionID, role: "user", time: { created: Date.now() }, agent: "build", model: { providerID: provider.originalID || provider.id, modelID } } }
@@ -104,12 +131,16 @@ async function conversation(provider, params, call) {
         parts.push(Buffer.from(value))
       }
     } finally { await reader?.cancel().catch(() => {}) }
-    await chunk(call, Buffer.from(JSON.stringify(responseError(response.status, Buffer.concat(parts).toString("utf8"), response.headers))))
+    const detail = responseError(response.status, Buffer.concat(parts).toString("utf8"), response.headers)
+    await wpsRecovery.failure(provider,params.account,modelID,auth,response.status,detail)
+    await chunk(call, Buffer.from(JSON.stringify(detail)))
     return null
   }
   const convert = response.ok && !native ? await rpc("script.stream.open", { protocol, model: modelID, session: signatureSession }) : null
   const reader = response.body?.getReader()
   if (!reader) throw new Error("Upstream returned no response body")
+  const wpsErrors=wpsRecovery.applies(provider) ? new WpsErrorFrames((status,body)=>
+    wpsRecovery.failure(provider,params.account,modelID,auth,status,body)) : null
   let count = 0
   try {
     for (;;) {
@@ -120,6 +151,7 @@ async function conversation(provider, params, call) {
       for (let start = 0; start < value.byteLength; start += MAX_CHUNK) {
         const part = value.subarray(start, start + MAX_CHUNK)
         const bytes = convert ? Buffer.from((await rpc("script.stream.push", { id: convert.id, data: Buffer.from(part).toString("base64") })).data, "base64") : part
+        if(wpsErrors)await wpsErrors.push(bytes)
         await chunk(call, bytes)
       }
     }
@@ -193,6 +225,7 @@ export async function dispatch(provider, method, params, call) {
     case "login.callback": return callback(provider, params)
     case "login.cancel": return cancel(provider, params.flow)
     case "admin.action":
+      if (params.action === "wps.recheck") return recoverWps(provider,params,call)
       if (params.action === "auth.methods") return methods(provider, params.payload?.locale)
       if (params.action === "auth.prompts") return resolvePrompts(provider, params.payload ?? {})
       throw unsupported()

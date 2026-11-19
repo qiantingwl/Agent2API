@@ -483,6 +483,7 @@ struct LiveWrite {
 /// **handler 返回之后**（由响应流自己被 axum 拉取），那时转发函数早已返回，
 /// 只能靠一个双方都能拿到的句柄传话。槽位只在一条请求内共享，不存在争用。
 pub struct RequestTelemetry {
+    effective_output_at: Mutex<Option<tokio::time::Instant>>,
     inner: Mutex<TelemetrySnapshot>,
     /// 请求安全状态独立于统计快照；attempt、首响及用量清理均不能替换或解除它。
     replay_guard: Arc<super::replay_guard::ReplayGuard>,
@@ -519,12 +520,26 @@ impl Default for RequestTelemetry {
 }
 
 impl RequestTelemetry {
+    pub(crate) fn note_effective_output(&self, frame: &Value) {
+        if super::startup::effective_output(frame) {
+            if let Ok(mut first) = self.effective_output_at.lock() {
+                first.get_or_insert_with(tokio::time::Instant::now);
+            }
+        }
+    }
+
+    pub(super) fn effective_output_before(&self, deadline: tokio::time::Instant) -> bool {
+        self.effective_output_at.lock().ok()
+            .is_some_and(|first| first.is_some_and(|at| at <= deadline))
+    }
+
     pub fn new() -> Self {
         Self::with_replay_guard(Arc::new(super::replay_guard::ReplayGuard::new()))
     }
 
     fn with_replay_guard(replay_guard: Arc<super::replay_guard::ReplayGuard>) -> Self {
         Self {
+            effective_output_at: Mutex::new(None),
             inner: Mutex::new(TelemetrySnapshot::default()),
             replay_guard,
             model_key: None,
@@ -607,6 +622,12 @@ impl RequestTelemetry {
 
     pub(super) fn response_started(&self) -> bool {
         self.lock().first_response_at.is_some()
+    }
+
+    pub(crate) fn response_started_for(&self, provider: &str) -> bool {
+        if provider == "wps-lingxi" {
+            self.effective_output_at.lock().map(|first| first.is_some()).unwrap_or(true)
+        } else { self.response_started() }
     }
 
     /// 本条请求是否已被手动终止（循环顶的同步判据；令牌缺省时恒 false）
@@ -735,6 +756,7 @@ impl RequestTelemetry {
     /// `provider` 同样是**最后一次**（多提供商轮询后真正承载请求的那家）。
     pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {
         let mut guard = self.lock();
+        if provider == "wps-lingxi" { guard.error = None; }
         guard.attempts += 1;
         guard.account_id = account_id.unwrap_or("").to_string();
         guard.account_name = account_name.to_string();
@@ -1176,6 +1198,43 @@ mod usage_extraction {
             "空对象也要出值：None 与「全 0」在调用侧是两条不同分支"
         );
     }
+}
+
+#[cfg(test)]
+mod exchange_regressions {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wps_retry_barrier_requires_effective_output() {
+        for delta in [json!({"content":"body"}), json!({"reasoning_content":"thinking"}), json!({"tool_calls":[{"id":"call"}]})] {
+            let telemetry = RequestTelemetry::new();
+            telemetry.note_first_frame();
+            telemetry.note_effective_output(&json!({"choices":[{"delta":{"role":"assistant","content":" \n"}}]}));
+            assert!(!telemetry.response_started_for("wps-lingxi"));
+            assert!(telemetry.response_started_for("other-provider"));
+            telemetry.note_effective_output(&json!({"choices":[{"delta":delta}]}));
+            assert!(telemetry.response_started_for("wps-lingxi"));
+            telemetry.note_attempt(None, "", "wps-lingxi");
+            assert!(telemetry.response_started_for("wps-lingxi"));
+        }
+    }
+
+    #[test]
+    fn new_wps_attempt_clears_request_error_but_preserves_attempt_failure() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.note_attempt(None, "", "wps-lingxi");
+        telemetry.note_attempt_started("wps-lingxi", "");
+        telemetry.note_error("rate limited");
+        telemetry.finish_last_attempt(Some(429), Some("rate limited"));
+        telemetry.note_attempt(None, "", "wps-lingxi");
+        let snapshot = telemetry.snapshot();
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.attempts_detail[0].error.as_deref(), Some("rate limited"));
+        assert!(!telemetry.replay_guard().blocked());
+    }
+
+
 }
 
 #[cfg(test)]

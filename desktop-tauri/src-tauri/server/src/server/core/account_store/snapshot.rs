@@ -160,11 +160,26 @@ fn route_account(account: &Value) -> Value {
         "id", "provider", "name", "nickname", "email", "userId", "uid", "account",
         "displayName", "priority", "addedAt", "enabled", "hasCredentials", "nameCustom",
         "needsRelogin", "allowRouteSkip", "maxConcurrent", "rateLimits", "routingCooldowns", "limiterGroups",
-        "upstreamCooldownUntil", "zcodePlan", "pool", "quotaChannel", "pluginModelPermissions", "usageConfigKey",
+        "upstreamCooldownUntil", "upstreamBlockedReason", "zcodePlan", "pool", "quotaChannel", "pluginModelPermissions", "usageConfigKey", "wpsRecovery",
     ] {
         if let Some(value) = account.get(key) { public.insert(key.to_string(), value.clone()); }
     }
     let source = account.pointer("/proxy/config/source").and_then(Value::as_str).unwrap_or("");
     public.insert("proxy".to_string(), json!({ "config": { "source": source } }));
     Value::Object(public)
+}
+
+#[cfg(test)]
+mod failure_recovery_tests {
+    use super::*;
+    #[test]
+    fn cached_route_retains_balance_verification_reason_without_secret() {
+        let public=json!({"id":"synthetic","provider":"loomy","enabled":true,
+            "upstreamBlockedReason":"余额待核验：上游返回402","upstreamCooldownUntil":200,
+            "accessToken":"synthetic-private"});
+        let projected=route_account(&public);
+        assert_eq!(projected["upstreamBlockedReason"],public["upstreamBlockedReason"]);
+        assert_eq!(projected["enabled"],true);
+        assert!(projected.get("accessToken").is_none());
+    }
 }

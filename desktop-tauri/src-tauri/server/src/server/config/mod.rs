@@ -72,6 +72,7 @@ pub(crate) mod compact_routes;
 pub(crate) mod error_policy;
 mod error_policy_types;
 pub(crate) mod runtime_capacity;
+pub(crate) mod quick_placeholder;
 pub(crate) mod title_routes;
 pub(crate) mod client_identification;
 pub(crate) mod prompt_rules;
@@ -2743,4 +2744,24 @@ mod auto_continue_tests {
             max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
         });
     }
+}
+
+pub fn kernel_dir_raw() -> Option<String> {
+    with_raw(|raw| raw.get("kernelDir").and_then(Value::as_str).map(str::to_string)).flatten()
+}
+pub fn kernel_proxy() -> Option<Value> {
+    with_raw(|raw| raw.get("kernelProxy").filter(|v| !v.is_null()).cloned()).flatten()
+}
+pub fn set_kernel_dir(dir: Option<String>) -> bool {
+    update(move |config| {
+        if let Some(value) = dir.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            config.raw.insert("kernelDir".into(), Value::String(value.into()));
+        } else { config.raw.remove("kernelDir"); }
+    })
+}
+pub fn set_kernel_proxy(proxy: Option<Value>) -> bool {
+    update(move |config| {
+        if let Some(value) = proxy.clone() { config.raw.insert("kernelProxy".into(), value); }
+        else { config.raw.remove("kernelProxy"); }
+    })
 }

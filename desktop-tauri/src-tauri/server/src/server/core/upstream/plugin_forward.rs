@@ -28,7 +28,7 @@ pub(super) async fn forward(
         if telemetry.replay_guard().blocked() { return Err(last_error.unwrap_or_else(super::replay_guard::blocked_error)); }
         let result = adapter.forward_conversation(store, account, body, headers, proxy.clone(), stream, telemetry).await;
         let Err(mut error) = result else { return result; };
-        if telemetry.replay_guard().blocked() || telemetry.response_started() { return Err(error); }
+        if telemetry.replay_guard().blocked() || telemetry.response_started_for(adapter.provider_id()) { return Err(error); }
         if telemetry.is_cancelled() { return Err(super::cancellation::cancelled_error()); }
         let status = u16::try_from(error.status_code).unwrap_or(502);
         let class = adapter.classify_conversation_error(&error);
@@ -59,7 +59,7 @@ pub(super) async fn forward(
                     result = refresh => result,
                 }
             } else { refresh.await };
-            if telemetry.replay_guard().blocked() || telemetry.response_started() { return Err(error); }
+            if telemetry.replay_guard().blocked() || telemetry.response_started_for(adapter.provider_id()) { return Err(error); }
             let delay = decision.retry_delay(0);
             if refreshed_result.is_err() || !budget.take_retry(delay) { return Err(error); }
             telemetry.note_attempt_retry("登录凭证已刷新，在原账号重试一次", Some(401), delay);

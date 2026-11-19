@@ -77,6 +77,7 @@ pub mod billing;
 pub mod branding;
 pub mod captcha;
 pub mod chat;
+mod quick_placeholder;
 // 签到中心的聚合快照（GET /api/checkin-center）：分组口径在后端唯一化，
 // 资格类状态由前端按需惰性查询，见该文件模块头
 pub mod checkin_center;
@@ -214,3 +215,7 @@ pub mod zcode_version;
 // 设置页「版本信息」：环境 / 版本 / 路径 / 开关状态的一次性读数
 // （`GET /api/system-info`，见该文件模块头）
 pub mod system_info;
+
+pub mod external_maintenance;
+
+pub mod subscriptions;

@@ -58,6 +58,7 @@ mod native_tools;
 pub(crate) mod http_dns;
 mod network_fallback;
 pub mod refusal;
+mod startup;
 pub mod request;
 pub mod native;
 mod native_payload;

@@ -1,4 +1,5 @@
 import * as React from 'react'
+import type { ProxySettings } from './proxies-state'
 import {
   Button,
   Checkbox,
@@ -273,61 +274,145 @@ export function ProxyModal({
 export function ProxySettingsModal({ onClose }: { onClose: () => void }) {
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
+  const [base, setBase] = React.useState('')
+  const [end, setEnd] = React.useState('')
   const [testUrl, setTestUrl] = React.useState('')
-  const [defaultUrl, setDefaultUrl] = React.useState('')
+  const [defaults, setDefaults] = React.useState<NonNullable<ProxySettings['defaults']>>({})
   const [error, setError] = React.useState('')
+  /** 保存成功后的一条常驻提示（告知内核重启的口径，不算错误） */
+  const [saved, setSaved] = React.useState(false)
 
   React.useEffect(() => {
     let alive = true
-    void loadSettings().then(data => {
-      if (!alive) return
-      if (!data) throw new Error(t('代理设置响应异常'))
-      setTestUrl(data.testUrl || '')
-      setDefaultUrl(data.defaults?.testUrl || '')
-    }).catch(cause => { if (alive) setError(errorMessage(cause)) })
-      .finally(() => { if (alive) setLoading(false) })
+    void (async () => {
+      try {
+        const data = await loadSettings()
+        if (!alive || data === null) return
+        setBase(String(data.listenerPortBase ?? ''))
+        setEnd(String(data.listenerPortEnd ?? ''))
+        setTestUrl(String(data.testUrl ?? ''))
+        setDefaults(data.defaults ?? {})
+        setLoading(false)
+      } catch (loadError) {
+        if (!alive) return
+        setError(errorMessage(loadError))
+        setLoading(false)
+      }
+    })()
     return () => { alive = false }
   }, [])
 
-  async function save(): Promise<void> {
-    if (saving || loading) return
-    const url = testUrl.trim()
-    if (url && !/^https?:\/\//i.test(url)) {
-      setError(t('测试网址要以 http:// 或 https:// 开头'))
-      return
+  /** 表单 → 提交 payload；形状非法时返回 null（错误写进 status 行） */
+  function draftPayload(): { listenerPortBase: number; listenerPortEnd: number; testUrl: string } | null {
+    const baseNumber = Number(base)
+    const endNumber = Number(end)
+    if (!Number.isInteger(baseNumber) || baseNumber < 1 || baseNumber > 65535
+      || !Number.isInteger(endNumber) || endNumber < 1 || endNumber > 65535) {
+      setError(t('端口范围必须是 1-65535 的整数'))
+      return null
     }
-    setSaving(true)
+    if (baseNumber > endNumber) {
+      setError(t('起始端口不能大于结束端口'))
+      return null
+    }
+    const url = testUrl.trim()
+    if (url && !url.startsWith('http://') && !url.startsWith('https://')) {
+      setError(t('测试网址要以 http:// 或 https:// 开头'))
+      return null
+    }
     setError('')
-    try {
-      await saveSettings({ testUrl: url })
-      toast(t('✅ 连通性测试设置已保存'))
-      onClose()
-    } catch (cause) {
-      setError(errorMessage(cause))
-    } finally { setSaving(false) }
+    return { listenerPortBase: baseNumber, listenerPortEnd: endNumber, testUrl: url }
   }
 
-  return <Dialog open onOpenChange={open => { if (!open && !saving) onClose() }}>
-    <DialogContent className='max-w-[500px]'>
-      <DialogHeader><DialogTitle>{t('连通性测试设置')}</DialogTitle></DialogHeader>
-      <DialogBody>
-        <div className='flex flex-col gap-1.5'>
-          <Label htmlFor='proxy-settings-url'>{t('测试目标网址')}</Label>
-          <Input id='proxy-settings-url' value={testUrl} placeholder={defaultUrl} autoComplete='off' spellCheck={false}
-            disabled={loading || saving} className='font-mono text-xs'
-            onChange={event => setTestUrl(event.currentTarget.value)} />
-        </div>
-        <p className='text-xs leading-[1.8] text-subtle'>
-          {t('通过代理访问该网址，检查是否能收到 HTTP 响应。留空沿用网关默认值。')}
-        </p>
-        {loading ? <p className='text-xs text-subtle'>{t('加载中…')}</p> : null}
-        {error ? <p className='text-xs text-destructive'>❌ {error}</p> : null}
-      </DialogBody>
-      <DialogFooter>
-        <Button variant='ghost' className='mr-auto' disabled={loading || saving} onClick={() => { setTestUrl(''); setError('') }}>{t('恢复默认')}</Button>
-        <Button variant='outline' disabled={saving} onClick={onClose}>{t('取消')}</Button>
-        <Button disabled={loading || saving} onClick={() => void save()}>{saving ? t('保存中…') : t('保存设置')}</Button>
-      </DialogFooter>
-    </DialogContent>
-  </Dialog>
+  async function save(): Promise<void> {
+    if (saving || loading) return
+    const payload = draftPayload()
+    if (!payload) return
+    setSaving(true)
+    try {
+      await saveSettings(payload)
+      setSaved(true)
+    } catch (saveError) {
+      setError(errorMessage(saveError))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /** 恢复默认：把默认值回填进表单（还不是「保存」—— 用户确认后一起提交） */
+  function resetToDefaults(): void {
+    setBase(String(defaults.listenerPortBase ?? ''))
+    setEnd(String(defaults.listenerPortEnd ?? ''))
+    setTestUrl(String(defaults.testUrl ?? ''))
+    setSaved(false)
+    setError('')
+  }
+
+  return (
+    <Dialog open onOpenChange={open => { if (!open && !saving) onClose() }}>
+      <DialogContent className='max-w-[560px]'>
+        <DialogHeader>
+          <DialogTitle>{t('代理设置')}</DialogTitle>
+        </DialogHeader>
+        <DialogBody className='flex flex-col gap-3.5'>
+          {loading ? (
+            <p className='text-xs text-subtle'>{t('加载中…')}</p>
+          ) : (
+            <>
+              <div className='flex flex-row items-end gap-2.5'>
+                <div className='flex min-w-0 flex-1 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-base'>{t('节点端口范围（起始）')}</Label>
+                  <Input id='proxy-settings-base' type='number' min={1} max={65535}
+                    placeholder={String(defaults.listenerPortBase ?? '')} autoComplete='off'
+                    value={base} onChange={event => { setBase(event.currentTarget.value); setSaved(false) }} />
+                </div>
+                <span aria-hidden='true' className='flex-none pb-[7px] text-subtle'>—</span>
+                <div className='flex min-w-0 flex-1 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-end'>{t('节点端口范围（结束）')}</Label>
+                  <Input id='proxy-settings-end' type='number' min={1} max={65535}
+                    placeholder={String(defaults.listenerPortEnd ?? '')} autoComplete='off'
+                    value={end} onChange={event => { setEnd(event.currentTarget.value); setSaved(false) }} />
+                </div>
+              </div>
+              <p className='text-xs leading-[1.65] text-subtle'>
+                {t('订阅节点会在本机各占一个监听端口，从该范围里挑空闲的分配；节点多的大订阅把默认范围（{base}-{end}）用尽时会报「没有可用的节点端口」，这时把范围调大再重启内核。已分配出去的端口不会因改范围而失效。', {
+                  base: defaults.listenerPortBase ?? '',
+                  end: defaults.listenerPortEnd ?? '',
+                })}
+              </p>
+
+              <div className='flex flex-col gap-1.5'>
+                <Label htmlFor='proxy-settings-url'>{t('出口测试网址')}</Label>
+                <Input id='proxy-settings-url' placeholder={defaults.testUrl || ''}
+                  autoComplete='off' spellCheck={false} className='font-mono text-[12px]'
+                  value={testUrl} onChange={event => { setTestUrl(event.currentTarget.value); setSaved(false) }} />
+              </div>
+              <p className='text-xs leading-[1.65] text-subtle'>
+                {t('「测试」与「批量测试」访问的目标；留空用默认（打 WorkBuddy 上游）。判据是能否拿到 HTTP 响应，不用考虑该网址返回什么内容。')}
+              </p>
+
+              <div className='min-h-[18px] text-xs'>
+                {error ? <span className='text-destructive'>❌ {error}</span> : null}
+                {!error && saved ? (
+                  <span className='text-success'>
+                    ✅ {t('已保存。重启内核后，新分配的节点端口才会按新范围来。')}
+                  </span>
+                ) : null}
+              </div>
+            </>
+          )}
+        </DialogBody>
+        <DialogFooter>
+          <Button variant='ghost' disabled={loading || saving} onClick={resetToDefaults}>
+            {t('恢复默认')}
+          </Button>
+          <div className='mr-auto' />
+          <Button variant='outline' disabled={saving} onClick={onClose}>{t('关闭')}</Button>
+          <Button variant='default' disabled={loading || saving} onClick={() => void save()}>
+            {saving ? t('保存中…') : t('保存')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }

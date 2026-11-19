@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { QuickPlaceholderSettings } from './settings-quick-placeholder'
 import { mountOnPage } from '../island-lazy'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
@@ -873,6 +874,7 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
       {panels.has('upstream_headers') ? <ClineHeadersPanel snap={snap} /> : null}
 
       <PromptPanel snap={snap} />
+      <QuickPlaceholderSettings />
 
       <Card render={<section />} className='panel'>
         <PanelHead
