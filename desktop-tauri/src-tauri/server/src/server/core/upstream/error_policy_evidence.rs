@@ -14,6 +14,23 @@ pub(super) fn machine_code(body: &Value) -> String {
     String::new()
 }
 
+// Older Loomy plugins wrap the account-disabled business response in a 502
+// and discard its numeric code. Preserve that specific evidence so the native
+// per-provider error-rule UI can distinguish it from a transport failure.
+pub(super) fn provider_code(provider: &str, class: &UpstreamErrorClass, status: u16, body: &Value) -> String {
+    let code = machine_code(body);
+    if provider == "loomy" && status == 502 {
+        if let UpstreamErrorClass::Fatal { message, upstream_code, .. } = class {
+            let message = message.trim();
+            if *upstream_code == Some(100003) || code == "100003"
+                || message == "账号已被停用" || message.ends_with(": 账号已被停用") {
+                return "loomy_account_disabled".into();
+            }
+        }
+    }
+    code
+}
+
 pub(super) fn kind(provider: &str, class: &UpstreamErrorClass, status: u16, code: &str) -> ErrorKind {
     if matches!(class, UpstreamErrorClass::ContentBlocked { .. }) { return ErrorKind::Content; }
     if matches!(class, UpstreamErrorClass::TokenExpired { .. }) { return ErrorKind::Auth; }

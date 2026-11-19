@@ -54,7 +54,7 @@ pub(crate) fn decide(provider: &str, model: &str, class: &UpstreamErrorClass, st
 pub(crate) fn decide_with(snapshot: &config::ErrorPolicySnapshot, provider: &str, model: &str, class: &UpstreamErrorClass,
     status: u16, body: &Value, local: bool, explicit_stop: bool) -> ErrorDecision {
     let settings = &snapshot.settings;
-    let code = evidence::machine_code(body);
+    let code = evidence::provider_code(provider, class, status, body);
     let kind = evidence::kind(provider, class, status, &code);
     let rule = settings.resolve(kind, status, &code, provider, model).clone();
     let upstream_scope = evidence::scope(body);
@@ -163,5 +163,41 @@ pub(super) fn exclude_provider(service: &super::UpstreamService, providers: &[&s
             let id = crate::server::core::routing_groups::attempt_key(&account);
             if !tried.contains(&id) { tried.push(id); }
         }
+    }
+}
+
+#[cfg(test)]
+mod observed_loomy_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_account_uses_native_exception_without_refresh_or_in_place_retry() {
+        let mut settings = config::ErrorSettings::default();
+        let mut rule = settings.rules.iter().find(|rule| rule.kind == ErrorKind::Transient).unwrap().clone();
+        rule.id = "loomy-disabled".into();
+        rule.name = "Loomy account disabled".into();
+        rule.provider = "loomy".into();
+        rule.code = "loomy_account_disabled".into();
+        rule.action = ErrorAction::SwitchAccount;
+        rule.cooldown = CooldownMode::Fixed;
+        rule.scope = CooldownScope::Account;
+        rule.fallback_seconds = 3600;
+        rule.fallback_cap_seconds = 3600;
+        settings.overrides.push(rule);
+        assert!(settings.validate().is_ok());
+        let snapshot = config::ErrorPolicySnapshot { settings, configured: true, legacy: false };
+        let class = UpstreamErrorClass::Fatal { status: 502,
+            message: "上游返回 502: 模型目录查询失败：上游返回 502: 账号已被停用".into(), upstream_code: None };
+        let decision = decide_with(&snapshot, "loomy", "model", &class, 502, &json!({}), false, false);
+        assert!(decision.switches() && decision.cooldown());
+        assert!(!decision.retries() && !decision.refreshes() && !decision.hard_stop);
+        assert_eq!(decision.scope, CooldownScope::Account);
+        assert_eq!(decision.rule.id, "loomy-disabled");
+        for provider in ["raccoon", "wps-lingxi"] {
+            assert!(decide_with(&snapshot, provider, "model", &class, 502, &json!({}), false, false).retries());
+        }
+        let ordinary = UpstreamErrorClass::Fatal { status: 502, message: "connection reset".into(), upstream_code: None };
+        assert!(decide_with(&snapshot, "loomy", "model", &ordinary, 502, &json!({}), false, false).retries());
+        assert!(decide_with(&snapshot, "loomy", "model", &ordinary, 403, &json!({}), false, false).hard_stop);
     }
 }

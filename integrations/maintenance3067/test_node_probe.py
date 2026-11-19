@@ -64,6 +64,8 @@ class ProbeTests(unittest.TestCase):
         self.fail('worker did not finish')
 
     def test_auth_rejection_is_reached_but_not_success(self):
+        self.assertFalse(outcome({'success': True, 'data': {'success': False, 'status': 403}})['httpOk'])
+        self.assertTrue(outcome({'success': True, 'data': {'success': True, 'status': 200}})['httpOk'])
         for status in (401, 403):
             result = outcome({'success': True, 'status': status, 'error': 'secret'})
             self.assertTrue(result['transportReached'])

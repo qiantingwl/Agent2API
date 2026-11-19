@@ -310,9 +310,54 @@ pub fn list() -> Vec<Value> {
 }
 
 fn find_raw(id: &str) -> Result<Value, String> {
-    read_items().into_iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    // Account list rendering resolves one proxy per account. Cache an indexed
+    // pool for the current SQLite revision instead of parsing the full pool
+    // thousands of times. Both local and external commits invalidate it.
+    static LOOKUP: OnceLock<Mutex<PoolLookup>> = OnceLock::new();
+    database().ok().and_then(|db| db.with(|conn| {
+        LOOKUP.get_or_init(|| Mutex::new(PoolLookup::default()))
+            .lock().unwrap_or_else(|error| error.into_inner()).find(conn, id)
+    }).flatten())
         .ok_or_else(|| format!("代理「{id}」不存在或已被删除"))
+}
+
+#[derive(Default)]
+struct PoolLookup {
+    revision: Option<(i64, i64)>,
+    items: std::collections::HashMap<String, Value>,
+}
+
+impl PoolLookup {
+    fn find(&mut self, conn: &rusqlite::Connection, id: &str) -> Option<Value> {
+        let version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0)).ok()?;
+        let changes: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).ok()?;
+        if self.revision != Some((version, changes)) {
+            let text: String = conn.query_row("SELECT value FROM kv WHERE key = ?1", [KV_KEY], |row| row.get(0)).ok()?;
+            let value: Value = serde_json::from_str(&text).ok()?;
+            self.items = value.get("items")?.as_array()?.iter().filter_map(|item|
+                Some((item.get("id")?.as_str()?.to_string(), item.clone()))).collect();
+            self.revision = Some((version, changes));
+        }
+        self.items.get(id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod pool_lookup_tests {
+    use super::*;
+    #[test]
+    fn cached_lookup_observes_local_and_external_changes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch("CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT); INSERT INTO kv VALUES('proxyPool','{\"items\":[{\"id\":\"node\",\"enabled\":true}]}');").unwrap();
+        let mut lookup = PoolLookup::default();
+        assert_eq!(lookup.find(&conn, "node").unwrap()["enabled"], true);
+        conn.execute("UPDATE kv SET value=?", [r#"{"items":[{"id":"node","enabled":false}]}"#]).unwrap();
+        assert_eq!(lookup.find(&conn, "node").unwrap()["enabled"], false);
+        let external = rusqlite::Connection::open(file.path()).unwrap();
+        external.execute("UPDATE kv SET value=?", [r#"{"items":[]}"#]).unwrap();
+        assert!(lookup.find(&conn, "node").is_none());
+    }
 }
 
 pub fn create_batch(input: &Value) -> Result<Value, String> {

@@ -17,6 +17,9 @@ DEFAULT = {'enabled': False, 'interval': 900, 'concurrency': 2}
 
 
 def outcome(value):
+    # The site-test endpoint separates request acceptance from target status.
+    if isinstance(value.get('data'), dict):
+        value = value['data']
     status = value.get('status')
     if type(status) is not int or not 100 <= status <= 599:
         status = None
