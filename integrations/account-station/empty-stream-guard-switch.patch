@@ -1,0 +1,258 @@
+diff --git a/backend/internal/pkg/streamplaceholder/placeholder.go b/backend/internal/pkg/streamplaceholder/placeholder.go
+--- a/backend/internal/pkg/streamplaceholder/placeholder.go
++++ b/backend/internal/pkg/streamplaceholder/placeholder.go
+@@ -19,9 +19,10 @@
+ )
+ 
+ type Settings struct {
+-	Enabled    bool `json:"enabled"`
+-	MinSeconds int  `json:"min_seconds"`
+-	MaxSeconds int  `json:"max_seconds"`
++	Enabled                 bool `json:"enabled"`
++	EmptyStreamGuardEnabled bool `json:"empty_stream_guard_enabled,omitempty"`
++	MinSeconds              int  `json:"min_seconds"`
++	MaxSeconds              int  `json:"max_seconds"`
+ }
+ 
+ func Parse(value any) (Settings, error) {
+diff --git a/backend/internal/service/account_stream_placeholder.go b/backend/internal/service/account_stream_placeholder.go
+--- a/backend/internal/service/account_stream_placeholder.go
++++ b/backend/internal/service/account_stream_placeholder.go
+@@ -16,6 +16,16 @@
+ 	}
+ 	_, err := streamplaceholder.Parse(extra["stream_placeholder"])
+ 	return err
++}
++
++// Extra empty-stream protection belongs to the optional account placeholder
++// extension. Turning the placeholder off also turns off its extra guard.
++func accountChatEmptyStreamGuardEnabled(a *Account) bool {
++	if os.Getenv("ACCOUNT_STREAM_PLACEHOLDER") != "1" || a == nil {
++		return false
++	}
++	settings, err := streamplaceholder.Parse(a.Extra["stream_placeholder"])
++	return err == nil && settings.Enabled && settings.EmptyStreamGuardEnabled
+ }
+ 
+ type accountPlaceholderWriter struct {
+diff --git a/backend/internal/service/openai_gateway_chat_completions_raw.go b/backend/internal/service/openai_gateway_chat_completions_raw.go
+--- a/backend/internal/service/openai_gateway_chat_completions_raw.go
++++ b/backend/internal/service/openai_gateway_chat_completions_raw.go
+@@ -331,7 +331,7 @@
+ 	pendingLines := make([]string, 0, 8)
+ 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
+ 	var emptyGuard *openAIChatEmptyStreamGuard
+-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
++	if accountChatEmptyStreamGuardEnabled(account) && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+ 		emptyGuard = &openAIChatEmptyStreamGuard{}
+ 	}
+ 	pendingBytes := 0
+diff --git a/backend/internal/service/openai_chat_empty_stream_test.go b/backend/internal/service/openai_chat_empty_stream_test.go
+--- a/backend/internal/service/openai_chat_empty_stream_test.go
++++ b/backend/internal/service/openai_chat_empty_stream_test.go
+@@ -13,6 +13,10 @@
+ )
+ 
+ func chatFrame(s string) string { return "data: " + s + "\n\n" }
++func enabledEmptyGuardAccount(t *testing.T) *Account {
++	t.Setenv("ACCOUNT_STREAM_PLACEHOLDER", "1")
++	return &Account{ID: 1, Platform: PlatformOpenAI, Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "empty_stream_guard_enabled": true}}}
++}
+ func TestRawChatEmptyStreamGuardCompatibility(t *testing.T) {
+ 	role := chatFrame(`{"choices":[{"delta":{"role":"assistant","content":"","reasoning_content":null,"tool_calls":null},"finish_reason":null}]}`)
+ 	stop := chatFrame(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+@@ -43,7 +47,7 @@
+ 			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+ 			resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(tc.stream))}
+ 			svc := &OpenAIGatewayService{cfg: &config.Config{}}
+-			_, err := svc.streamRawChatCompletions(c, resp, &Account{ID: 1, Platform: PlatformOpenAI}, "m", "m", "m", nil, nil, time.Now(), 32)
++			_, err := svc.streamRawChatCompletions(c, resp, enabledEmptyGuardAccount(t), "m", "m", "m", nil, nil, time.Now(), 32)
+ 			var failover *UpstreamFailoverError
+ 			if tc.retry {
+ 				if !errors.As(err, &failover) || rec.Body.Len() != 0 {
+@@ -62,7 +66,7 @@
+ 	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+ 	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+ 	resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}
+-	_, err := svc.streamRawChatCompletions(c, resp, &Account{ID: 1, Platform: PlatformOpenAI}, "m", "m", "m", nil, nil, time.Now(), 32)
++	_, err := svc.streamRawChatCompletions(c, resp, enabledEmptyGuardAccount(t), "m", "m", "m", nil, nil, time.Now(), 32)
+ 	if err != nil || rec.Body.String() != stream {
+ 		t.Fatalf("bounded fallback did not preserve stream: %v", err)
+ 	}
+diff --git a/backend/internal/service/openai_chat_proxy_stream_error_test.go b/backend/internal/service/openai_chat_proxy_stream_error_test.go
+--- a/backend/internal/service/openai_chat_proxy_stream_error_test.go
++++ b/backend/internal/service/openai_chat_proxy_stream_error_test.go
+@@ -29,7 +29,7 @@
+ 			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+ 			response := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(tc.prelude + failure))}
+ 			svc := &OpenAIGatewayService{cfg: &config.Config{}}
+-			result, err := svc.streamRawChatCompletions(c, response, &Account{ID: 195, Platform: "deepseek"}, "deepseek-v4.1-flash", "deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", nil, nil, time.Now(), 32)
++			result, err := svc.streamRawChatCompletions(c, response, enabledEmptyGuardAccount(t), "deepseek-v4.1-flash", "deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", nil, nil, time.Now(), 32)
+ 			var retry *UpstreamFailoverError
+ 			t.Logf("returned_error=%v retry=%v bytes_exposed=%d has_result=%v", err, errors.As(err, &retry), rec.Body.Len(), result != nil)
+ 			if tc.wantRetry {
+@@ -83,7 +83,7 @@
+ 			body := tc.prelude + tc.frame + done
+ 			resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}
+ 			svc := &OpenAIGatewayService{cfg: &config.Config{}}
+-			result, err := svc.streamRawChatCompletions(c, resp, &Account{ID: 195, Platform: "deepseek"}, "m", "m", "m", nil, nil, time.Now(), 32)
++			result, err := svc.streamRawChatCompletions(c, resp, enabledEmptyGuardAccount(t), "m", "m", "m", nil, nil, time.Now(), 32)
+ 			var retry *UpstreamFailoverError
+ 			if errors.As(err, &retry) != tc.retry || (err != nil) != tc.failed {
+ 				t.Fatalf("retry/failure wrong: %v", err)
+diff --git a/backend/internal/service/account_stream_placeholder_retry_test.go b/backend/internal/service/account_stream_placeholder_retry_test.go
+--- a/backend/internal/service/account_stream_placeholder_retry_test.go
++++ b/backend/internal/service/account_stream_placeholder_retry_test.go
+@@ -21,7 +21,7 @@
+ 	c, _ := gin.CreateTestContext(rec)
+ 	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+ 	original := c.Writer
+-	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1, Credentials: map[string]any{"api_key": "test", "base_url": "http://upstream.example"}, Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "min_seconds": 0, "max_seconds": 0}}}
++	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1, Credentials: map[string]any{"api_key": "test", "base_url": "http://upstream.example"}, Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "empty_stream_guard_enabled": true, "min_seconds": 0, "max_seconds": 0}}}
+ 	stop, finish := StartAccountStreamPlaceholder(c, a, true, "deepseek-v4.1-flash")
+ 	defer finish()
+ 	wrapper := c.Writer.(*accountPlaceholderWriter)
+@@ -75,7 +75,7 @@
+ 	rec := httptest.NewRecorder()
+ 	c, _ := gin.CreateTestContext(rec)
+ 	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+-	a := &Account{Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "min_seconds": 0, "max_seconds": 0}}}
++	a := &Account{Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "empty_stream_guard_enabled": true, "min_seconds": 0, "max_seconds": 0}}}
+ 	stop, finish := StartAccountStreamPlaceholder(c, a, true, "m")
+ 	p := c.Writer.(*accountPlaceholderWriter).p
+ 	deadline := time.Now().Add(time.Second)
+@@ -100,7 +100,7 @@
+ 	c, _ := gin.CreateTestContext(rec)
+ 	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+ 	original := c.Writer
+-	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1, Credentials: map[string]any{"api_key": "test", "base_url": "http://upstream.example"}, Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "min_seconds": 0, "max_seconds": 0}}}
++	a := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1, Credentials: map[string]any{"api_key": "test", "base_url": "http://upstream.example"}, Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "empty_stream_guard_enabled": true, "min_seconds": 0, "max_seconds": 0}}}
+ 	stop, finish := StartAccountStreamPlaceholder(c, a, true, "deepseek-v4.1-flash")
+ 	defer finish()
+ 	wrapper := c.Writer.(*accountPlaceholderWriter)
+diff --git a/backend/internal/service/account_empty_guard_switch_test.go b/backend/internal/service/account_empty_guard_switch_test.go
+new file mode 100644
+--- /dev/null
++++ b/backend/internal/service/account_empty_guard_switch_test.go
+@@ -0,0 +1,78 @@
++package service
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/config"
++	"github.com/gin-gonic/gin"
++)
++
++type placeholderSwitchReadProbe struct {
++	reader *strings.Reader
++	writer *httptest.ResponseRecorder
++	reads  int
++	t      *testing.T
++}
++
++func (p *placeholderSwitchReadProbe) Read(b []byte) (int, error) {
++	if p.reads == 0 {
++		p.reads++
++		return copy(b, switchTestPrelude), nil
++	}
++	if p.reads == 1 {
++		p.reads++
++		if !p.writer.Flushed || !strings.Contains(p.writer.Body.String(), "chatcmpl-gateway-placeholder") {
++			p.t.Error("disabled extension buffered AG placeholder")
++		}
++	}
++	return p.reader.Read(b)
++}
++
++const switchTestPrelude = "data: {\"id\":\"chatcmpl-gateway-placeholder\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n"
++
++func TestRawChatEmptyStreamGuardSwitch(t *testing.T) {
++	for _, tc := range []struct {
++		name                 string
++		env                  string
++		enabled, guard, want bool
++	}{
++		{"both-on", "1", true, true, true},
++		{"placeholder-off", "1", false, true, false},
++		{"guard-off", "1", true, false, false},
++		{"both-off", "1", false, false, false},
++		{"process-off", "0", true, true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("ACCOUNT_STREAM_PLACEHOLDER", tc.env)
++			a := &Account{Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": tc.enabled, "empty_stream_guard_enabled": tc.guard}}}
++			if got := accountChatEmptyStreamGuardEnabled(a); got != tc.want {
++				t.Fatalf("guard enabled=%v want=%v", got, tc.want)
++			}
++			if tc.want {
++				return
++			}
++			rec := httptest.NewRecorder()
++			c, _ := gin.CreateTestContext(rec)
++			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
++			tail := chatFrame(`{"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`) + "data: [DONE]\n\n"
++			probe := &placeholderSwitchReadProbe{reader: strings.NewReader(tail), writer: rec, t: t}
++			resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(probe)}
++			svc := &OpenAIGatewayService{cfg: &config.Config{}}
++			_, err := svc.streamRawChatCompletions(c, resp, a, "m", "m", "m", nil, nil, time.Now(), 32)
++			if err != nil || rec.Body.String() != switchTestPrelude+tail {
++				t.Fatalf("passthrough changed: %v", err)
++			}
++		})
++	}
++	t.Setenv("ACCOUNT_STREAM_PLACEHOLDER", "1")
++	for _, a := range []*Account{nil, {}, {Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true}}}, {Extra: map[string]any{"stream_placeholder": map[string]any{"enabled": true, "empty_stream_guard_enabled": "true"}}}} {
++		if accountChatEmptyStreamGuardEnabled(a) {
++			t.Fatal("missing or invalid switch enabled guard")
++		}
++	}
++}
+diff --git a/frontend/src/components/account/EditAccountModal.vue b/frontend/src/components/account/EditAccountModal.vue
+--- a/frontend/src/components/account/EditAccountModal.vue
++++ b/frontend/src/components/account/EditAccountModal.vue
+@@ -1931,6 +1931,11 @@
+           <span class="font-medium">首字占位</span>
+           <input v-model="placeholderEnabled" type="checkbox" role="switch" aria-label="首字占位" class="h-4 w-4 accent-primary-600" />
+         </label>
++        <label class="mt-3 flex items-center justify-between gap-3">
++          <span class="text-sm">空返检测</span>
++          <input v-model="placeholderEmptyGuardEnabled" :disabled="!placeholderEnabled" type="checkbox" role="switch" aria-label="空返检测" class="h-4 w-4 accent-primary-600 disabled:opacity-40" />
++        </label>
++        <p class="input-hint mt-1">需同时开启首字占位和空返检测才生效。关闭首字占位后，本站不再额外缓冲上游 Chat 流。</p>
+         <div v-if="placeholderEnabled" class="mt-3 grid grid-cols-2 gap-3">
+           <label class="text-sm">最小秒数<input v-model.number="placeholderMin" type="number" min="0" max="60" step="1" class="input mt-1" /></label>
+           <label class="text-sm">最大秒数<input v-model.number="placeholderMax" type="number" min="0" max="60" step="1" class="input mt-1" /></label>
+@@ -4139,6 +4144,7 @@
+ // 上游ID：直接上游声明请求标识的响应头名，留空不记录。
+ const upstreamRequestIdHeader = ref('')
+ const placeholderEnabled = ref(false)
++const placeholderEmptyGuardEnabled = ref(false)
+ const placeholderMin = ref(1)
+ const placeholderMax = ref(5)
+ const readUpstreamRequestIdHeader = (extra: unknown): string => {
+@@ -4687,8 +4693,9 @@
+ 	mixedScheduling.value = extra?.mixed_scheduling === true
+ 	allowOverages.value = extra?.allow_overages === true
+ 	upstreamRequestIdHeader.value = readUpstreamRequestIdHeader(extra)
+-  const placeholder = extra?.stream_placeholder as {enabled?:boolean;min_seconds?:number;max_seconds?:number} | undefined
++  const placeholder = extra?.stream_placeholder as {enabled?:boolean;empty_stream_guard_enabled?:boolean;min_seconds?:number;max_seconds?:number} | undefined
+   placeholderEnabled.value = placeholder?.enabled === true
++  placeholderEmptyGuardEnabled.value = placeholder?.empty_stream_guard_enabled === true
+   placeholderMin.value = Number.isInteger(placeholder?.min_seconds) ? placeholder!.min_seconds! : 1
+   placeholderMax.value = Number.isInteger(placeholder?.max_seconds) ? placeholder!.max_seconds! : 5
+ 
+@@ -6468,7 +6475,7 @@
+       if (![placeholderMin.value, placeholderMax.value].every(v => Number.isInteger(v) && v >= 0 && v <= 60) || placeholderMax.value < placeholderMin.value) {
+         throw new Error('占位秒数须为0至60的整数，最大值不得小于最小值')
+       }
+-      const setting = {enabled:placeholderEnabled.value, min_seconds:placeholderMin.value, max_seconds:placeholderMax.value}
++      const setting = {enabled:placeholderEnabled.value, empty_stream_guard_enabled:placeholderEmptyGuardEnabled.value, min_seconds:placeholderMin.value, max_seconds:placeholderMax.value}
+       const previous = (props.account.extra as Record<string,unknown> | undefined)?.stream_placeholder
+       if (setting.enabled || previous !== undefined) {
+         updatePayload.extra = {...((updatePayload.extra || props.account.extra || {}) as Record<string,unknown>), stream_placeholder:setting}

@@ -1,0 +1,14 @@
+{
+  "files": [
+    "backend/internal/pkg/streamplaceholder/placeholder.go",
+    "backend/internal/service/account_stream_placeholder.go",
+    "backend/internal/service/openai_gateway_chat_completions_raw.go",
+    "backend/internal/service/openai_chat_empty_stream_test.go",
+    "backend/internal/service/openai_chat_proxy_stream_error_test.go",
+    "backend/internal/service/account_stream_placeholder_retry_test.go",
+    "backend/internal/service/account_empty_guard_switch_test.go",
+    "frontend/src/components/account/EditAccountModal.vue"
+  ],
+  "baseline": "Sub2API 0.2.23 with previously deployed account extension",
+  "behavior": "explicit opt-in and placeholder switch required; absent switch is off; no AG ID special case"
+}
