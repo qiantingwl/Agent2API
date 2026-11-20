@@ -1685,6 +1685,25 @@ async fn attempt_queue(
             Gate::Live(response)
         };
 
+        let gate = if super::startup::applies_to(provider_id)
+            && response_protocol == crate::server::core::providers::adapter::UpstreamResponse::Chat {
+            let checked = match gate {
+                Gate::Live(response) => super::startup::hold_response(response, ctx.telemetry).await,
+                Gate::Held(head) => super::startup::hold_head(head, ctx.telemetry).await,
+            };
+            match checked {
+                Ok(head) => Gate::Held(head),
+                Err(mut error) => {
+                    ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+                    if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
+                        &target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {
+                        last_error = Some(error); continue 'accounts;
+                    }
+                    return Err(error);
+                }
+            }
+        } else { gate };
+
         let mut response_policy = frame_policy_of(adapter, &model);
         if ctx.routing.group.is_some() { response_policy.rewrite = Some(super::sse::ModelRewrite { requested: model.clone() }); }
         response_policy.native_tools = native_tools;
@@ -2322,6 +2341,13 @@ async fn attempt_stateful(
             adapter, &service.store, target.account_id.as_deref().unwrap_or(""), body,
             ctx.client_headers, target.proxy.clone(), ctx.stream, ctx.telemetry, budget,
         ).await
+    };
+    // Keep ownership in the account loop until this attempt produces useful output.
+    // The downstream acknowledgement is independent and cannot commit this account.
+    let forwarded = match forwarded {
+        Ok(outcome) if ctx.images.is_none() && ctx.native.is_none() && super::startup::applies_to(provider_id) =>
+            super::startup::hold_outcome(outcome, ctx.telemetry).await,
+        other => other,
     };
     match forwarded {
         Ok(outcome) => {

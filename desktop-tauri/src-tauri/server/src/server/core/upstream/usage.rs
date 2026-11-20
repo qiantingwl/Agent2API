@@ -625,7 +625,7 @@ impl RequestTelemetry {
     }
 
     pub(crate) fn response_started_for(&self, provider: &str) -> bool {
-        if provider == "wps-lingxi" {
+        if super::startup::applies_to(provider) {
             self.effective_output_at.lock().map(|first| first.is_some()).unwrap_or(true)
         } else { self.response_started() }
     }
@@ -1206,17 +1206,19 @@ mod exchange_regressions {
     use serde_json::json;
 
     #[test]
-    fn wps_retry_barrier_requires_effective_output() {
+    fn placeholder_platform_retry_barrier_requires_effective_output() {
+        for provider in ["loomy", "raccoon", "wps-lingxi"] {
         for delta in [json!({"content":"body"}), json!({"reasoning_content":"thinking"}), json!({"tool_calls":[{"id":"call"}]})] {
             let telemetry = RequestTelemetry::new();
             telemetry.note_first_frame();
             telemetry.note_effective_output(&json!({"choices":[{"delta":{"role":"assistant","content":" \n"}}]}));
-            assert!(!telemetry.response_started_for("wps-lingxi"));
+            assert!(!telemetry.response_started_for(provider));
             assert!(telemetry.response_started_for("other-provider"));
             telemetry.note_effective_output(&json!({"choices":[{"delta":delta}]}));
-            assert!(telemetry.response_started_for("wps-lingxi"));
-            telemetry.note_attempt(None, "", "wps-lingxi");
-            assert!(telemetry.response_started_for("wps-lingxi"));
+            assert!(telemetry.response_started_for(provider));
+            telemetry.note_attempt(None, "", provider);
+            assert!(telemetry.response_started_for(provider));
+        }
         }
     }
 
