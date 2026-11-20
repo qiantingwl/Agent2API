@@ -290,7 +290,6 @@ async fn chat_completions_inner(
                 None => source,
             };
             let source = pipeline::catpaw_output::observe_stream(source, &telemetry);
-            let source = super::chat_stream::finalize(source, telemetry.clone());
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let context = RecordContext {
                 stats,

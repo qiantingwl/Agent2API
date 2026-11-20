@@ -77,7 +77,6 @@ pub mod billing;
 pub mod branding;
 pub mod captcha;
 pub mod chat;
-mod chat_stream;
 mod quick_placeholder;
 // 签到中心的聚合快照（GET /api/checkin-center）：分组口径在后端唯一化，
 // 资格类状态由前端按需惰性查询，见该文件模块头

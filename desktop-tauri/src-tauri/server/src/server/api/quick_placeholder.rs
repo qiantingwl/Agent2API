@@ -72,15 +72,35 @@ fn placeholder(model: &str) -> Bytes {
 }
 
 async fn read_prelude(body: &mut BodyDataStream, prefix: &mut Vec<Result<Bytes, axum::Error>>) {
-    let mut retained_bytes = 0;
+    let mut pending = Vec::new();
+    let mut scanned = 0;
+    let mut line_start = 0;
+    let mut event_start = 0;
     while let Some(item) = body.next().await {
         let ready = match &item {
             Ok(bytes) if bytes.is_empty() => continue,
+            Ok(bytes) if bytes.len() >= MAX_PRELUDE - pending.len() => true,
             Ok(bytes) => {
-                retained_bytes += bytes.len();
-                // Chat's stream finalizer yields only complete SSE events on both paths.
-                // Bound how much metadata we can hold for a slow stream, as Sub does.
-                retained_bytes >= MAX_PRELUDE || contains_output_or_terminal(bytes)
+                pending.extend_from_slice(bytes);
+                // A body chunk can contain several events or just part of one.
+                // Leave the original chunks intact for the client.
+                let mut useful = false;
+                for (index, &byte) in pending.iter().enumerate().skip(scanned) {
+                    if byte != b'\n' {
+                        continue;
+                    }
+                    let line = &pending[line_start..index];
+                    line_start = index + 1;
+                    if line.is_empty() || line == b"\r" {
+                        if contains_output_or_terminal(&pending[event_start..=index]) {
+                            useful = true;
+                            break;
+                        }
+                        event_start = index + 1;
+                    }
+                }
+                scanned = pending.len();
+                useful
             }
             Err(_) => true,
         };
@@ -91,34 +111,35 @@ async fn read_prelude(body: &mut BodyDataStream, prefix: &mut Vec<Result<Bytes, 
     }
 }
 
-fn contains_output_or_terminal(bytes: &[u8]) -> bool {
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        let mut len = 0;
-        for line in remaining.split_inclusive(|&byte| byte == b'\n') {
-            len += line.len();
-            if line == b"\n" || line == b"\r\n" {
-                break;
-            }
+fn contains_output_or_terminal(event: &[u8]) -> bool {
+    let mut lines = event.split(|&byte| byte == b'\n').filter_map(|line| {
+        line.strip_suffix(b"\r")
+            .unwrap_or(line)
+            .strip_prefix(b"data:")
+            .map(|data| data.strip_prefix(b" ").unwrap_or(data))
+    });
+    let Some(first) = lines.next() else { return false };
+    let mut joined = Vec::new();
+    let data = if let Some(second) = lines.next() {
+        joined.extend_from_slice(first);
+        for line in std::iter::once(second).chain(lines) {
+            joined.push(b'\n');
+            joined.extend_from_slice(line);
         }
-        let (event, rest) = remaining.split_at(len);
-        remaining = rest;
-        let Some(data) = super::chat_stream::event_data(event) else { continue };
-        if data.as_ref() == b"[DONE]" {
-            return true;
-        }
-        let Ok(frame) = serde_json::from_slice::<Value>(&data) else { continue };
-        if frame.get("error").is_some_and(|error| !error.is_null())
-            || crate::server::core::upstream::chat_effective_output(&frame)
-            || frame.get("choices").and_then(Value::as_array).is_some_and(|choices| {
-                choices.iter().any(|choice| choice.get("finish_reason").and_then(Value::as_str)
-                    .is_some_and(|reason| !reason.is_empty()))
-            })
-        {
-            return true;
-        }
+        &joined
+    } else {
+        first
+    };
+    if data.trim_ascii() == b"[DONE]" {
+        return true;
     }
-    false
+    let Ok(frame) = serde_json::from_slice::<Value>(data) else { return false };
+    frame.get("error").is_some_and(|error| !error.is_null())
+        || crate::server::core::upstream::chat_effective_output(&frame)
+        || frame.get("choices").and_then(Value::as_array).is_some_and(|choices| {
+            choices.iter().any(|choice| choice.get("finish_reason").and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty()))
+        })
 }
 
 async fn after_placeholder(response: Response) -> stream::BoxStream<'static, Result<Bytes, io::Error>> {
@@ -188,6 +209,31 @@ mod tests {
         assert_eq!(source.next().await.unwrap().unwrap(), role);
         assert_eq!(source.next().await.unwrap().unwrap(), text);
         assert!(source.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn meaningful_event_split_across_chunks_is_not_delayed() {
+        let chunks = [
+            Bytes::from_static(b": heart"),
+            Bytes::from_static(b"beat\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"ans"),
+            Bytes::from_static(b"wer\"}}]}\r\n"),
+            Bytes::from_static(b"\r\n"),
+        ];
+        let expected = chunks.clone();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), respond(
+            "synthetic".into(),
+            Instant::now() + std::time::Duration::from_secs(5),
+            async move {
+                let streaming = stream::iter(chunks.into_iter().map(Ok::<_, io::Error>))
+                    .chain(stream::pending());
+                Response::builder().header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(streaming)).unwrap()
+            },
+        )).await.unwrap();
+        let mut source = response.into_body().into_data_stream();
+        for chunk in expected {
+            assert_eq!(source.next().await.unwrap().unwrap(), chunk);
+        }
     }
 
     #[tokio::test]
