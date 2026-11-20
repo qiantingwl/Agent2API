@@ -2345,7 +2345,7 @@ async fn attempt_stateful(
     // Keep ownership in the account loop until this attempt produces useful output.
     // The downstream acknowledgement is independent and cannot commit this account.
     let forwarded = match forwarded {
-        Ok(outcome) if ctx.images.is_none() && ctx.native.is_none() && super::startup::applies_to(provider_id) =>
+        Ok(outcome) if ctx.images.is_none() && super::startup::applies_to(provider_id) =>
             super::startup::hold_outcome(outcome, ctx.telemetry).await,
         other => other,
     };
