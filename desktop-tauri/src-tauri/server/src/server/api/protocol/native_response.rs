@@ -25,6 +25,11 @@ pub(in crate::server::api) fn respond(
                 WireProtocol::Responses => pipeline::terminal::RESPONSES,
                 WireProtocol::Chat => pipeline::terminal::CHAT,
             };
+            let source = if response.protocol == WireProtocol::Chat {
+                super::super::chat_stream::finalize(source, context.telemetry.clone())
+            } else {
+                source
+            };
             let stream = RecordingStream::with_terminals(source, context, terminals);
             guard.handoff();
             pipeline::sse_response(status, Box::new(stream))

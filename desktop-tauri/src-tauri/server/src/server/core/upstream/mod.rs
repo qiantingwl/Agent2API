@@ -59,6 +59,7 @@ pub(crate) mod http_dns;
 mod network_fallback;
 pub mod refusal;
 mod startup;
+pub(in crate::server) use startup::effective_output as chat_effective_output;
 pub mod request;
 pub mod native;
 mod native_payload;

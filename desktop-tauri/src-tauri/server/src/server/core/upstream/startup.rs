@@ -30,7 +30,7 @@ fn useful(frame: &Value) -> bool {
         .is_some_and(|cs| cs.iter().any(|c| c.get("finish_reason").and_then(Value::as_str) == Some("content_filter")))
 }
 
-pub(super) fn effective_output(frame: &Value) -> bool {
+pub(in crate::server) fn effective_output(frame: &Value) -> bool {
     frame.get("choices").and_then(Value::as_array).is_some_and(|choices| choices.iter().any(|c| {
         let delta = c.get("delta").or_else(|| c.get("message"));
         delta.is_some_and(|d| ["content", "reasoning_content", "reasoning", "tool_calls", "function_call"].iter().any(|key| {

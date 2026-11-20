@@ -81,6 +81,8 @@ pub async fn chat_completions(
     key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
     body: Bytes,
 ) -> Response {
+    let received_at = tokio::time::Instant::now();
+    let started_at = logging::now_ms();
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let streaming = parsed.as_ref().is_some_and(|value| value.is_object()
         && value.get("stream") == Some(&Value::Bool(true))
@@ -91,10 +93,13 @@ pub async fn chat_completions(
             .and_then(Value::as_str).unwrap_or("gateway").to_string();
         // API-key authentication has already completed in the router middleware.
         // Model/route failures after acknowledgement remain explicit SSE errors.
-        return super::quick_placeholder::respond(model, crate::server::config::quick_placeholder::delay(placeholder),
-            chat_completions_inner(State(state),headers,key_scope,key_identity,key_source,body)).await;
+        return super::quick_placeholder::respond(
+            model,
+            received_at + crate::server::config::quick_placeholder::delay(placeholder),
+            chat_completions_inner(State(state), headers, key_scope, key_identity, key_source, body, parsed, started_at),
+        ).await;
     }
-    chat_completions_inner(State(state),headers,key_scope,key_identity,key_source,body).await
+    chat_completions_inner(State(state), headers, key_scope, key_identity, key_source, body, parsed, started_at).await
 }
 
 async fn chat_completions_inner(
@@ -109,15 +114,14 @@ async fn chat_completions_inner(
     key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
     key_source: Option<Extension<Arc<crate::server::config::model_key_source::Source>>>,
     body: Bytes,
+    parsed: Option<Value>,
+    started_at: i64,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
-    // 请求开始时刻（请求统计用）。放在最前面：它要覆盖 body 解析与选路的耗时
-    let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：在 headers 被 move 进转发层
     // 之前先判好，早失败路径与收尾记账共用同一个值
     let request_source = pipeline::request_source(&headers, key_identity);
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
-    let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
         record_early_failure(&state, started_at, "", "", &request_source, &error);
@@ -286,6 +290,7 @@ async fn chat_completions_inner(
                 None => source,
             };
             let source = pipeline::catpaw_output::observe_stream(source, &telemetry);
+            let source = super::chat_stream::finalize(source, telemetry.clone());
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let context = RecordContext {
                 stats,
