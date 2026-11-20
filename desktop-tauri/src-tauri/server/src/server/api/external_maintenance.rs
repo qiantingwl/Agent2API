@@ -77,8 +77,13 @@ pub async fn apply(State(state): State<ServerState>, Json(body): Json<Receipt>) 
             let changed = apply_login_invalid(&mut updated, &body.expect, body.observed_at,
                 usage_records::load(&body.account).last_success_at, now)?;
             if changed {
-                store.with_conn(&guard, |conn| sql::update_in_place(conn, &updated))
+                let written = store.with_conn(&guard, |conn| {
+                    if newer_chat_proof(conn, &body.account, body.observed_at)? { return Ok(false); }
+                    sql::update_in_place(conn, &updated)?;
+                    Ok(true)
+                })
                     .map_err(|_| (503, "Login state update unavailable"))?;
+                if !written { return Err((409, "Newer successful response already present")); }
             }
             return Ok(json!({"applied": true, "duplicate": !changed}));
         }
@@ -140,6 +145,11 @@ pub async fn apply(State(state): State<ServerState>, Json(body): Json<Receipt>) 
         Ok(Err((code, message))) => error_response(code, message),
         Err(_) => error_response(503, "Maintenance receipt unavailable"),
     }
+}
+
+fn newer_chat_proof(conn: &rusqlite::Connection, account: &str, observed_at: i64) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM requests WHERE account_id=?1 AND status>=200 AND status<300 AND error IS NULL AND completion_tokens>0 AND ts+MAX(duration_ms,0)>=?2)",
+        rusqlite::params![account, observed_at], |row| row.get(0))
 }
 
 /// A confirmed provider rejection only affects the exact credential tested.
@@ -223,6 +233,24 @@ mod closure_tests {
         record.set_updated_at(40);
         assert_eq!(apply_login_invalid(&mut record, &expect, 20, 40, 50).unwrap_err().0, 409);
         assert!(record.get("needsRelogin").is_none());
+    }
+    #[test]
+    fn only_successful_nonempty_newer_chat_proves_recovery() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE requests(account_id TEXT,status INTEGER,error TEXT,completion_tokens INTEGER,ts INTEGER,duration_ms INTEGER);").unwrap();
+        for (account, status, error, tokens, ts, duration) in [
+            ("other", 200, None, 5, 10, 20),
+            ("test", 200, Some("stream interrupted"), 5, 10, 20),
+            ("test", 200, None, 0, 10, 20),
+            ("test", 401, None, 5, 10, 20),
+            ("test", 200, None, 5, 1, 2),
+        ] {
+            conn.execute("INSERT INTO requests VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![account,status,error,tokens,ts,duration]).unwrap();
+        }
+        assert!(!newer_chat_proof(&conn, "test", 20).unwrap());
+        conn.execute("INSERT INTO requests VALUES('test',200,NULL,5,10,20)", []).unwrap();
+        assert!(newer_chat_proof(&conn, "test", 20).unwrap());
     }
     #[test]
     fn missing_or_invalid_balance_is_not_a_successful_observation() {
