@@ -41,7 +41,24 @@ pub(super) fn finalize(source: ResponseStream, telemetry: Arc<RequestTelemetry>)
                             return failure(source, events, telemetry, message);
                         }
                         None if events.buffer.is_empty() && events.finished() => break,
-                        None => return failure(source, events, telemetry, TRUNCATED),
+                        None => {
+                            // Some native upstreams close after the [DONE] line without
+                            // sending the blank line that normally delimits the event.
+                            if events.buffer.ends_with(b"\n")
+                                && event_data(&events.buffer).is_some_and(|data| data.as_ref() == b"[DONE]")
+                            {
+                                events.ended = true;
+                                let line_end = if events.buffer.ends_with(b"\r\n") {
+                                    b"\r\n".as_slice()
+                                } else {
+                                    b"\n".as_slice()
+                                };
+                                events.buffer.extend_from_slice(line_end);
+                                let done = events.buffer.split().freeze();
+                                return Some((Ok(done), (source, events, telemetry)));
+                            }
+                            return failure(source, events, telemetry, TRUNCATED);
+                        }
                     }
                 }
                 None
@@ -218,6 +235,11 @@ mod tests {
             .map(|b| Ok(Bytes::copy_from_slice(b)))
             .collect();
         let (actual, telemetry) = run(items).await;
+        assert_eq!(actual, success);
+        assert!(telemetry.snapshot().error.is_none());
+
+        let single_newline = success.strip_suffix("\r\n").unwrap();
+        let (actual, telemetry) = run(vec![Ok(Bytes::copy_from_slice(single_newline.as_bytes()))]).await;
         assert_eq!(actual, success);
         assert!(telemetry.snapshot().error.is_none());
     }
