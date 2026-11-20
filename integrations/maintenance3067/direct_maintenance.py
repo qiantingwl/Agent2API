@@ -1,6 +1,6 @@
 """Durable maintenance receipts and independently retried deliveries to Agent2API."""
 import datetime, hashlib, json, math, threading, time, urllib.error
-from direct_clients import Unsupported
+from direct_clients import Unsupported, UpstreamError
 from ag_wps_client import Client, pending_wps_models
 from maintenance_state import credential_version
 from unified_sync import source_record, auth_token, millis
@@ -18,6 +18,15 @@ def fingerprint(secret):
     return hashlib.sha256(json.dumps(secret,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 
 class DeliveryPending(RuntimeError):pass
+
+LOGIN_INVALID_MESSAGE='上游已确认登录凭证失效，AG 已接收失效标记，请重新登录'
+
+def saved_outcome(result, message):
+    # Old successful receipts lack an outcome; authentication receipts must never
+    # turn into a successful balance/credential job when their delivery is retried.
+    outcome=result.get('outcome') or ({'status':'needs_login','message':LOGIN_INVALID_MESSAGE}
+        if result['gateway']['action']=='login_invalid' else {'status':'ok','message':message})
+    return {**outcome,'credentialVersion':credential_version(result['gateway']['expect'])}
 
 def confirmed_day_key(account, timestamp):
     day=datetime.datetime.fromtimestamp(timestamp/1000,datetime.timezone(datetime.timedelta(hours=8))).date().isoformat()
@@ -105,7 +114,7 @@ class DirectMaintenance:
         with self.db() as c:existing=c.execute('select payload from direct_results where id=?',(jid,)).fetchone()
         if existing:
             self.deliver(jid,include_mirror=False)
-            return {'status':'ok','message':'已完成结果重新投递，没有重复访问上游','credentialVersion':credential_version(self.decode(existing[0])['gateway']['expect'])}
+            return saved_outcome(self.decode(existing[0]),'已完成结果重新投递，没有重复访问上游')
         if a=='checkin':
             with self.db() as c:confirmed=c.execute('select 1 from ledger where key=?',(confirmed_day_key(aid,self.now()),)).fetchone()
             if confirmed:return {'status':'skipped','message':'今日签到已有官方确认，不再重复签到；余额独立补查'}
@@ -130,6 +139,7 @@ class DirectMaintenance:
         client=Client(p,s,proxy,timeout,lambda key,value=None:self.client_ledger(aid,p,s,key,value))
         observed=self.now()
         payload={'account':aid,'provider':p,'action':action,'requestId':jid,'observedAt':observed,'expect':expect}
+        outcome=None
         try:
             if action=='balance':
                 usage=client.balance()
@@ -146,18 +156,26 @@ class DirectMaintenance:
                 payload['observedAt']=observed
             elif action=='credential':payload['secret']=client.renew()
             else:raise Unsupported('当前操作未接管')
+        except UpstreamError as error:
+            if p not in ('loomy','raccoon') or getattr(error,'status',None)!='needs_login':raise
+            # Only classified upstream evidence enters the same durable outbox.
+            # Do not send error text or perform another login/refresh request.
+            payload={'account':aid,'provider':p,'action':'login_invalid','requestId':jid,
+                     'observedAt':observed,'expect':expect}
+            outcome={'status':'needs_login','message':LOGIN_INVALID_MESSAGE}
         finally:client.close()
         result={'gateway':payload,'lease':lease,'completedAt':self.now()}
+        if outcome:result['outcome']=outcome
         with self.db() as c:
             c.execute('begin immediate')
-            c.execute('insert into direct_results values(?,?,?,?,?)',(jid,aid,action,self.encode(result),self.now()))
+            c.execute('insert into direct_results values(?,?,?,?,?)',(jid,aid,payload['action'],self.encode(result),self.now()))
             if action=='checkin' and payload.get('confirmed'):
                 c.execute('insert or replace into ledger values(?,?)',(confirmed_day_key(aid,payload['observedAt']),str(payload['observedAt'])))
             for target in ('gateway','mirai'):
                 c.execute('insert into direct_outbox(result,target,status) values(?,?,?)',(jid,target,'pending' if target=='gateway' else 'not_required'))
-            if action=='credential':c.execute("update direct_renewals set status='saved',updated=? where account=? and version=?",(self.now(),aid,version))
+            if action=='credential':c.execute('update direct_renewals set status=?,updated=? where account=? and version=?',('failed' if outcome else 'saved',self.now(),aid,version))
         self.deliver(jid,include_mirror=False)
-        return {'status':'ok','message':'独立请求完成，AG 已确认接收','credentialVersion':credential_version(expect)}
+        return saved_outcome(result,'独立请求完成，AG 已确认接收')
 
     def deliver(self,jid,include_mirror=True):
         with self.delivery_lock:
@@ -179,6 +197,7 @@ class DirectMaintenance:
                 except Exception as e:
                     conflict=target=='gateway' and isinstance(e,urllib.error.HTTPError) and e.code==409
                     with self.db() as c:c.execute('update direct_outbox set status=?,attempts=attempts+1,next_at=?,error=? where result=? and target=?',('conflict' if conflict else 'pending',self.now()+min(300000,5000*2**min(item.get('attempts',0),6)), '凭证或结果已更新，未覆盖' if conflict else '接收端未确认，等待重投',jid,target))
+                    if conflict:raise Unsupported('结果对应的凭证或时间已过期，未覆盖新状态') from None
                     if target=='gateway':raise DeliveryPending('结果已安全保存，等待同步；未重复执行上游操作') from None
             if out['gateway'].get('status')=='conflict':raise Unsupported('结果对应的凭证或时间已过期，未覆盖新状态')
             if out['gateway'].get('status')!='done':raise DeliveryPending('结果等待同步')

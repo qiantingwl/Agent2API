@@ -1,11 +1,53 @@
 import contextlib,json,sqlite3,tempfile,unittest,urllib.error
 from pathlib import Path
-from unittest.mock import patch
-from direct_clients import Client,codearts_usage,Unsupported
+from unittest.mock import patch,Mock
+from direct_clients import Client,codearts_usage,Unsupported,UpstreamError,AuthenticationError
 from direct_maintenance import DirectMaintenance,DeliveryPending
 from mirai_bridge import target_status
 
 class ProtocolTests(unittest.TestCase):
+    def response(self,status,body):
+        response=Mock(status_code=status)
+        response.__enter__=Mock(return_value=response)
+        response.__exit__=Mock(return_value=False)
+        response.iter_content.return_value=[json.dumps(body).encode()]
+        return response
+
+    def test_only_confirmed_upstream_authentication_is_typed(self):
+        for provider in ('loomy','raccoon','codearts','wps-lingxi'):
+            for status in (401,403,429,500):
+                with self.subTest(provider=provider,status=status):
+                    c=Client(provider,{})
+                    with patch.object(c.session,'request',return_value=self.response(status,{'message':'private upstream detail'})):
+                        with self.assertRaises(UpstreamError) as raised:c.request('GET','https://upstream.invalid')
+                    self.assertEqual(isinstance(raised.exception,AuthenticationError),status==401 and provider in ('loomy','raccoon'))
+                    self.assertNotIn('private upstream detail',str(raised.exception))
+                    c.close()
+
+    def test_loomy_explicit_business_auth_codes(self):
+        for code in ('020002','100002'):
+            c=Client('loomy',{'session':'test'})
+            with patch.object(c,'request',return_value={'code':code}):
+                with self.assertRaises(AuthenticationError):c.loomy('/balance')
+            c.close()
+
+    def test_missing_local_credentials_are_not_upstream_auth_evidence(self):
+        for provider in ('loomy','raccoon'):
+            c=Client(provider,{})
+            with patch.object(c.session,'request') as request:
+                with self.assertRaises(UpstreamError) as raised:getattr(c,provider)('/balance')
+                self.assertNotIsInstance(raised.exception,AuthenticationError)
+                request.assert_not_called()
+            c.close()
+
+    def test_codearts_apig_auth_error_keeps_existing_classification(self):
+        c=Client('codearts',{})
+        with patch.object(c.session,'request',return_value=self.response(401,{'error_code':'APIG.0602'})):
+            with self.assertRaises(UpstreamError) as raised:c.request('GET','https://upstream.invalid')
+            self.assertNotIsInstance(raised.exception,AuthenticationError)
+            self.assertIn('APIG.0602',str(raised.exception))
+        c.close()
+
     def test_missing_balance_stays_unknown(self):
         c=Client('loomy',{'session':'synthetic'})
         c.loomy=lambda *args:{'dailyBalance':'50'}
@@ -91,6 +133,78 @@ class OutboxTests(unittest.TestCase):
         self.engine=DirectMaintenance(db,json.dumps,json.loads,lambda aid:({'id':aid,'provider':'loomy','enabled':1},{'pluginSecret':self.secret}),lambda:type('Official',(),{'call':staticmethod(official)})(),lambda:1794360000000,lambda *a:None,lambda *a:self.follow.append(a))
 
     def tearDown(self):self.temp.cleanup()
+
+    def test_login_invalid_is_durable_and_retry_keeps_failed_outcome(self):
+        job={'id':'auth-receipt','account':'a','provider':'loomy','action':'balance'}
+        with patch('direct_maintenance.Client') as client:
+            client.return_value.balance.side_effect=AuthenticationError('private upstream detail')
+            with self.assertRaises(DeliveryPending):self.engine.execute(job)
+            client.return_value.close.assert_called_once()
+            with self.db() as c:
+                record=c.execute('select action,payload from direct_results').fetchone()
+                result=json.loads(record['payload'])
+                self.assertEqual(record['action'],'login_invalid')
+                self.assertEqual(result['outcome']['status'],'needs_login')
+                self.assertEqual(set(result['gateway']),{'account','provider','action','requestId','observedAt','expect'})
+                self.assertEqual(result['gateway']['expect'],self.secret)
+                self.assertNotIn('private upstream detail',record['payload'])
+                self.assertEqual(c.execute('select count(*) from ledger').fetchone()[0],0)
+                c.execute('update direct_outbox set next_at=0')
+            self.fail=False
+            repeated=self.engine.execute(job)
+            self.assertEqual(repeated['status'],'needs_login')
+            self.assertEqual(client.return_value.balance.call_count,1)
+            self.assertEqual(client.call_count,1)
+            self.assertFalse(self.follow)
+
+    def test_each_maintenance_action_preserves_auth_failure_and_lease(self):
+        self.fail=False
+        for provider,action in (('raccoon','balance'),('loomy','checkin'),('loomy','credential')):
+            with self.subTest(provider=provider,action=action),patch('direct_maintenance.Client') as client:
+                method={'balance':'balance','checkin':'checkin','credential':'renew'}[action]
+                getattr(client.return_value,method).side_effect=AuthenticationError('private')
+                result=self.engine.execute({'id':provider+'-'+action,'account':'a','provider':provider,'action':action})
+                self.assertEqual(result['status'],'needs_login')
+                client.return_value.close.assert_called_once()
+                if action=='credential':
+                    self.assertEqual(self.calls[-1],'/api/external-maintenance/lease')
+                    with self.db() as c:self.assertEqual(c.execute('select status from direct_renewals').fetchone()[0],'failed')
+        self.assertFalse(self.follow)
+        with self.db() as c:self.assertEqual(c.execute('select count(*) from ledger').fetchone()[0],0)
+
+    def test_other_errors_do_not_emit_login_invalid(self):
+        for index,error in enumerate((UpstreamError('HTTP 403'),UpstreamError('HTTP 429'),TimeoutError('timeout'))):
+            with self.subTest(error=error),patch('direct_maintenance.Client') as client:
+                client.return_value.balance.side_effect=error
+                with self.assertRaises(type(error)):self.engine.execute({'id':str(index),'account':'a','provider':'loomy','action':'balance'})
+                client.return_value.close.assert_called_once()
+        with patch('direct_maintenance.Client') as client:
+            client.return_value.balance.side_effect=AuthenticationError('invalid')
+            with self.assertRaises(AuthenticationError):self.engine.execute({'id':'wps','account':'a','provider':'wps-lingxi','action':'balance'})
+        with self.db() as c:self.assertEqual(c.execute('select count(*) from direct_results').fetchone()[0],0)
+
+    def test_gateway_management_401_is_only_a_delivery_failure(self):
+        official=Mock(side_effect=urllib.error.HTTPError('http://management',401,'invalid key',{},None))
+        self.engine.official=lambda:type('Official',(),{'call':staticmethod(official)})()
+        with patch('direct_maintenance.Client') as client:
+            client.return_value.balance.return_value={'available':12}
+            with self.assertRaises(DeliveryPending):self.engine.execute({'id':'management','account':'a','provider':'loomy','action':'balance'})
+        with self.db() as c:
+            row=c.execute('select action,payload from direct_results').fetchone()
+            self.assertEqual(row['action'],'balance')
+            self.assertNotIn('needs_login',row['payload'])
+
+    def test_stale_auth_receipt_conflict_never_repeats_upstream(self):
+        official=Mock(side_effect=urllib.error.HTTPError('http://management',409,'old credential',{},None))
+        self.engine.official=lambda:type('Official',(),{'call':staticmethod(official)})()
+        with patch('direct_maintenance.Client') as client:
+            client.return_value.balance.side_effect=AuthenticationError('invalid')
+            job={'id':'stale','account':'a','provider':'loomy','action':'balance'}
+            with self.assertRaisesRegex(Unsupported,'未覆盖新状态'):self.engine.execute(job)
+            with self.assertRaises(Unsupported):self.engine.execute(job)
+            client.return_value.balance.assert_called_once()
+        with self.db() as c:
+            self.assertEqual(c.execute("select status from direct_outbox where target='gateway'").fetchone()[0],'conflict')
 
     def test_delivery_failure_does_not_repeat_upstream(self):
         job={'id':'j','account':'a','provider':'loomy','action':'balance'}

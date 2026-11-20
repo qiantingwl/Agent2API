@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::server::{ServerState, logging, http::ok_json};
 use crate::server::core::{blocking, usage_records, usage_query};
-use crate::server::core::account_store::{sql, plugin_accounts::secret_of};
+use crate::server::core::account_store::{sql, plugin_accounts::secret_of, state::StoredAccount};
 use super::maintenance::error_response;
 
 #[derive(Deserialize)]
@@ -47,7 +47,7 @@ pub async fn lease(State(state): State<ServerState>, Json(body): Json<LeaseReque
 pub async fn apply(State(state): State<ServerState>, Json(body): Json<Receipt>) -> Response {
     let now = logging::now_ms();
     if !matches!(body.provider.as_str(), "loomy" | "raccoon" | "codearts" | "wps-lingxi")
-        || !matches!(body.action.as_str(), "balance" | "credential" | "checkin")
+        || !matches!(body.action.as_str(), "balance" | "credential" | "checkin" | "login_invalid")
         || body.request_id.is_empty() || body.request_id.len() > 160
         || body.observed_at <= 0 || body.observed_at > now + 30_000 || !body.expect.is_object()
     { return error_response(400, "Invalid maintenance receipt"); }
@@ -72,6 +72,16 @@ pub async fn apply(State(state): State<ServerState>, Json(body): Json<Receipt>) 
         let record = store.record_by_id(&guard, &body.account).ok_or((404, "Account missing"))?;
         if record.provider() != body.provider { return Err((409, "Provider changed")); }
         if secret_of(&record) != body.expect { return Err((409, "Credential changed; receipt rejected")); }
+        if body.action == "login_invalid" {
+            let mut updated = record;
+            let changed = apply_login_invalid(&mut updated, &body.expect, body.observed_at,
+                usage_records::load(&body.account).last_success_at, now)?;
+            if changed {
+                store.with_conn(&guard, |conn| sql::update_in_place(conn, &updated))
+                    .map_err(|_| (503, "Login state update unavailable"))?;
+            }
+            return Ok(json!({"applied": true, "duplicate": !changed}));
+        }
         if body.action == "balance" {
             let usage = body.usage.filter(Value::is_object).ok_or((400, "Missing usage observation"))?;
             if !valid_usage_observation(&usage) {
@@ -132,6 +142,25 @@ pub async fn apply(State(state): State<ServerState>, Json(body): Json<Receipt>) 
     }
 }
 
+/// A confirmed provider rejection only affects the exact credential tested.
+/// Conservatively reject observations older than any account update or successful
+/// balance proof. Replayed receipts must not extend the login failure timestamp.
+fn apply_login_invalid(record: &mut StoredAccount, expect: &Value, observed_at: i64,
+    last_success_at: i64, now: i64) -> Result<bool, (u16, &'static str)> {
+    if !matches!(record.provider().as_str(), "loomy" | "raccoon") {
+        return Err((400, "Login failure receipt unsupported for this provider"));
+    }
+    if secret_of(record) != *expect { return Err((409, "Credential changed; receipt rejected")); }
+    if record.get("needsRelogin").and_then(Value::as_bool) == Some(true) { return Ok(false); }
+    if observed_at <= record.updated_at() || observed_at <= last_success_at {
+        return Err((409, "Newer account state or authentication proof already present"));
+    }
+    record.set("needsRelogin", Value::Bool(true));
+    record.set("needsReloginReason", Value::String("独立维护已确认当前登录凭证失效，需要重新登录".into()));
+    record.set_updated_at(now);
+    Ok(true)
+}
+
 
 fn valid_usage_observation(usage: &Value) -> bool {
     usage.get("unlimited").and_then(Value::as_bool) == Some(true)
@@ -151,6 +180,50 @@ fn clearable_login_proof(provider: &str, flagged: bool, changed_at: i64, observe
 #[cfg(test)]
 mod closure_tests {
     use super::*;
+    fn login_record(provider: &str, enabled: bool) -> StoredAccount {
+        StoredAccount::from_value(json!({"id":"test", "provider":provider,
+            "pluginSecret":{"token":"current"}, "updatedAt":10, "enabled":enabled})).unwrap()
+    }
+    #[test]
+    fn login_failure_uses_native_flag_without_changing_manual_switch() {
+        for provider in ["loomy", "raccoon"] {
+            for enabled in [true, false] {
+                let mut record = login_record(provider, enabled);
+                let expect = secret_of(&record);
+                assert_eq!(apply_login_invalid(&mut record, &expect, 20, 0, 30), Ok(true));
+                assert_eq!(record.get("needsRelogin"), Some(&Value::Bool(true)));
+                assert_eq!(record.enabled(), enabled);
+                assert_eq!(apply_login_invalid(&mut record, &expect, 20, 0, 40), Ok(false));
+                assert_eq!(record.updated_at(), 30);
+            }
+        }
+    }
+    #[test]
+    fn stale_or_wrong_credential_failure_does_not_disable_account() {
+        for (observed, success) in [(10, 0), (9, 0), (20, 20), (20, 21)] {
+            let mut record = login_record("raccoon", true);
+            let expect = secret_of(&record);
+            assert_eq!(apply_login_invalid(&mut record, &expect, observed, success, 30).unwrap_err().0, 409);
+            assert!(record.get("needsRelogin").is_none());
+        }
+        let mut record = login_record("raccoon", true);
+        assert_eq!(apply_login_invalid(&mut record, &json!({"token":"old"}), 20, 0, 30).unwrap_err().0, 409);
+        assert!(record.get("needsRelogin").is_none());
+        let mut record = login_record("wps-lingxi", true);
+        let expect = secret_of(&record);
+        assert_eq!(apply_login_invalid(&mut record, &expect, 20, 0, 30).unwrap_err().0, 400);
+    }
+    #[test]
+    fn replay_after_successful_recovery_is_rejected() {
+        let mut record = login_record("raccoon", true);
+        let expect = secret_of(&record);
+        assert_eq!(apply_login_invalid(&mut record, &expect, 20, 0, 30), Ok(true));
+        record.remove("needsRelogin");
+        record.remove("needsReloginReason");
+        record.set_updated_at(40);
+        assert_eq!(apply_login_invalid(&mut record, &expect, 20, 40, 50).unwrap_err().0, 409);
+        assert!(record.get("needsRelogin").is_none());
+    }
     #[test]
     fn missing_or_invalid_balance_is_not_a_successful_observation() {
         for usage in [json!({}), json!({"available":null}), json!({"available":true}),

@@ -16,6 +16,9 @@ CODEARTS='https://snap-access.cn-north-4.myhuaweicloud.com'
 STS='https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens'
 
 class UpstreamError(RuntimeError): pass
+class AuthenticationError(UpstreamError):
+    """An explicit authentication rejection received from Loomy or Raccoon."""
+    status='needs_login'
 class Unsupported(RuntimeError): pass
 
 def number(value):
@@ -90,6 +93,8 @@ class Client:
                     chunks.append(chunk)
                 raw=b''.join(chunks)
                 if not 200<=r.status_code<300:
+                    if r.status_code==401 and self.provider in ('loomy','raccoon'):
+                        raise AuthenticationError('上游已确认登录凭证失效，请重新登录')
                     try:error=json.loads(raw)
                     except (ValueError,TypeError):error={}
                     if isinstance(error,dict) and error.get('error_code')=='APIG.0602':
@@ -108,7 +113,7 @@ class Client:
         headers={'token':token,'Authorization':'Bearer '+token,'Content-Type':'application/json'}
         result=self.request('POST' if body is not None else 'GET',LOOMY+path,headers,json.dumps(body,separators=(',',':')).encode() if body is not None else None)
         code=str(result.get('code',''))
-        if code in ('020002','100002'):raise UpstreamError('HTTP 401 session expired')
+        if code in ('020002','100002'):raise AuthenticationError('Loomy 已确认登录凭证失效，请重新登录')
         if code!='000000':raise UpstreamError('Loomy business response rejected')
         data=result.get('data')
         if not isinstance(data,dict):raise UpstreamError('Loomy missing data')
