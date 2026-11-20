@@ -52,14 +52,14 @@ impl AccountStore {
         saved.then_some(entry)
     }
 
-    pub(crate) fn policy_cooldown_for(&self, provider: &str, model: &str) -> Option<Value> {
+    pub(crate) fn provider_policy_cooldowns(&self) -> Option<Value> {
         let guard = self.guard();
-        self.with_conn(&guard, |conn| load_providers(conn)).ok().and_then(|state| {
-            let limits = state.get(provider)?;
-            [limits.get(model), limits.get("@provider")].into_iter().flatten()
-                .filter(|entry| entry["resetAt"].as_i64().is_some_and(|at| at > logging::now_ms()))
-                .max_by_key(|entry| entry["resetAt"].as_i64().unwrap_or(0)).cloned()
-        })
+        self.with_conn(&guard, load_providers).ok()
+    }
+
+    pub(crate) fn policy_cooldown_for(&self, provider: &str, model: &str) -> Option<Value> {
+        let state = self.provider_policy_cooldowns()?;
+        active_provider_cooldown(state.get(provider)?, model, logging::now_ms()).cloned()
     }
 
     pub(crate) fn clear_provider_policy_cooldowns(&self, account_id: &str) -> Result<usize, String> {
@@ -127,6 +127,14 @@ pub(crate) fn cooldown_entry(previous: Option<&Value>, status: i32, code: Option
     json!({ "status": status, "code": code, "resetAt": until, "message": truncate_chars(message, 300),
         "at": now, "strikes": strikes, "guessed": guessed, "kind": rule.kind, "ruleId": rule.id,
         "scope": scope, "timeSource": if guessed { "fallback" } else { "upstream" } })
+}
+
+pub(crate) fn active_provider_cooldown<'a>(limits: &'a Value, model: &str, now: i64) -> Option<&'a Value> {
+    [limits.get(model), limits.get("@provider")]
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["resetAt"].as_i64().is_some_and(|at| at > now))
+        .max_by_key(|entry| entry["resetAt"].as_i64().unwrap_or(0))
 }
 
 fn load_providers(conn: &rusqlite::Connection) -> rusqlite::Result<Value> {
