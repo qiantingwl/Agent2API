@@ -539,9 +539,6 @@ pub(super) async fn forward_with_providers(
     let candidates = super::native_payload::filter_candidates(&ctx, candidates)?;
     // 候选链已是 id 空间（`route_for_forward` 的返回值，见 router 的模块头）：
     // 内置家与自定义家的 id 同列，自定义 id 直接透传给选路与分派。
-    // Loomy 与小浣熊的纯 Chat 候选共用首段预算；其他提供商及图片路径保持原有行为。
-    let startup_deadline = super::startup::applies_to(&candidates, ctx.images.is_some())
-        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(config::timeout_settings().headers_ms().min(120_000)));
     let provider_ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
     // 映射扩池的提示：链比本名承载家长，说明追加了映射的提供商（选路顺序仍是
     // 原生优先）。用户看到请求落到映射家时，这里与发送侧的改写日志对得上。
@@ -558,7 +555,7 @@ pub(super) async fn forward_with_providers(
     );
     crate::server::core::plugin_host::account_egress::scope(
         ctx.telemetry,
-        attempt_queue(service, &ctx, &provider_ids, slot, connections, startup_deadline),
+        attempt_queue(service, &ctx, &provider_ids, slot, connections),
     ).await
 }
 
@@ -630,7 +627,6 @@ async fn attempt_queue(
     provider_ids: &[&str],
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
-    startup_deadline: Option<tokio::time::Instant>,
 ) -> Result<ForwardOutcome, GatewayError> {
     let model = model_of(ctx.body);
     let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
@@ -717,9 +713,6 @@ async fn attempt_queue(
     'accounts: for _ in 0..=MAX_ROUTE_ATTEMPTS {
         if ctx.telemetry.replay_guard().blocked() {
             return Err(last_error.unwrap_or_else(super::replay_guard::blocked_error));
-        }
-        if startup_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-            return Err(super::startup::timeout_error());
         }
         // ── 手动终止：每一轮选路之前先看令牌 ────────────────────────
         // 覆盖「回到循环」的所有时刻：去重排队、退避睡眠、换号顺延、上游
@@ -856,7 +849,7 @@ async fn attempt_queue(
             // 没有下一个可用账号时，把这个错误原样透传（它的文案最贴近真实原因）。
             let stateful_account_id = target.account_id.clone();
             let failed_target = target.clone();
-            let attempt = Box::pin(attempt_stateful(
+            match attempt_stateful(
                 service,
                 ctx,
                 provider_id,
@@ -866,12 +859,9 @@ async fn attempt_queue(
                 connections,
                 degraded,
                 &mut budget,
-                startup_deadline,
-            ));
-            let attempted = if let Some(deadline) = startup_deadline {
-                super::startup::await_outcome(attempt, deadline, ctx.telemetry).await
-            } else { attempt.await };
-            match attempted {
+            )
+            .await
+            {
                 Ok(outcome) => {
                     if let Some(account_id) = stateful_account_id.as_deref() {
                         service.route.sticky_bind(
@@ -1319,7 +1309,7 @@ async fn attempt_queue(
                 return Err(error);
             }
             budget.model = wire_model.clone();
-            let sending = super::error_policy_send::send_with_retry(
+            match super::error_policy_send::send_with_retry(
                 adapter,
                 &transport,
                 &mut budget,
@@ -1330,18 +1320,9 @@ async fn attempt_queue(
                     _ => None,
                 },
                 plan.policy.network.as_ref(),
-            );
-            let sent = if let Some(deadline) = startup_deadline {
-                match tokio::time::timeout_at(deadline, sending).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let error = super::startup::timeout_error();
-                        ctx.telemetry.finish_last_attempt(Some(504), Some(&error.message));
-                        return Err(error);
-                    }
-                }
-            } else { sending.await };
-            match sent {
+            )
+            .await
+            {
                 Ok(response) => {
                     // 成功出口：这一轮的结果是「成功 + 状态码」，明细在这里定稿。
                     // 失败出口在下面（`Err(failure)` 那一支的开头）—— 两个出口
@@ -1658,10 +1639,7 @@ async fn attempt_queue(
             && response_protocol == crate::server::core::providers::adapter::UpstreamResponse::Chat
             && response.status().is_success()
         {
-            let head = if let Some(deadline) = startup_deadline {
-                tokio::time::timeout_at(deadline, refusal::hold_head(response)).await
-                    .map_err(|_| super::startup::timeout_error())?
-            } else { refusal::hold_head(response).await };
+            let head = refusal::hold_head(response).await;
             // 两条判据汇成一个三元组 `(给明细的文案, 是不是配额型, 给客户端标签)`：
             //   · 配额型（**正文标记**命中）⇒ **罚账号**（冷却到正文里的窗口重置时刻）+ 换家；
             //   · 内容型（`finish_reason` 命中）⇒ 不罚账号（内容问题，换谁都会拒）+ 换家。
@@ -1707,28 +1685,6 @@ async fn attempt_queue(
             Gate::Live(response)
         };
 
-        let gate = match (startup_deadline, gate) {
-            (Some(deadline), Gate::Live(response)) if response_protocol == crate::server::core::providers::adapter::UpstreamResponse::Chat => {
-                match super::startup::hold_response(response, deadline, ctx.telemetry).await {
-                    Ok(head) => Gate::Held(head),
-                    Err(error) => {
-                        ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
-                        if super::startup::retryable_before_output(&error, deadline) {
-                            if !tried_ids.contains(&attempt_key) { tried_ids.push(attempt_key.clone()); }
-                            if target.account_id.as_deref().is_some_and(|id| rotate::allows_route_skip(service, id))
-                                && rotate::pick_next_account(service, provider_ids, &cooldown_keys,
-                                    &tried_ids, ctx.pinned_account, &ctx.routing).is_some()
-                                && take_switch(&mut switches_left, switch_total)
-                            {
-                                continue 'accounts;
-                            }
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            (_, gate) => gate,
-        };
         let mut response_policy = frame_policy_of(adapter, &model);
         if ctx.routing.group.is_some() { response_policy.rewrite = Some(super::sse::ModelRewrite { requested: model.clone() }); }
         response_policy.native_tools = native_tools;
@@ -2255,7 +2211,6 @@ async fn attempt_stateful(
     connections: &mut ConnectionGuard,
     degraded: bool,
     budget: &mut RetryBudget,
-    startup_deadline: Option<tokio::time::Instant>,
 ) -> Result<ForwardOutcome, GatewayError> {
     if ctx.telemetry.replay_guard().blocked() { return Err(super::replay_guard::blocked_error()); }
     let model = model_of(ctx.body);
@@ -2348,7 +2303,7 @@ async fn attempt_stateful(
             describe_proxy(target.proxy.as_ref()),
         ),
     );
-    let forward = async { if let Some(operation) = ctx.images {
+    let forwarded = if let Some(operation) = ctx.images {
         adapter.forward_images(target.account_id.as_deref().unwrap_or(""), body,
             ctx.client_headers, target.proxy.clone(), operation, ctx.telemetry).await
     } else if let Some(native) = ctx.native.filter(|native| {
@@ -2367,12 +2322,7 @@ async fn attempt_stateful(
             adapter, &service.store, target.account_id.as_deref().unwrap_or(""), body,
             ctx.client_headers, target.proxy.clone(), ctx.stream, ctx.telemetry, budget,
         ).await
-    } };
-    // Validate before donating request/account guards to the returned stream.
-    // A rejected prefix must leave the request slot owned by the account loop.
-    let forwarded = if let Some(deadline) = startup_deadline {
-        super::startup::hold_outcome(forward, deadline, ctx.telemetry).await
-    } else { forward.await };
+    };
     match forwarded {
         Ok(outcome) => {
             // 收到响应流还不能证明成功；提前写账号也会作废该流的条件冷却来源。

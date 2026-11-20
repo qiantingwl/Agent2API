@@ -510,10 +510,18 @@ pub(super) fn scoped_accounts(
         crate::server::core::routing_scope::apply_accounts(&accounts, model)
     };
     let keys = routing::CooldownKeys::new(model);
+    // Every candidate in this routing pass reads the same provider state.
+    let provider_cooldowns = if accounts.is_empty() {
+        None
+    } else {
+        service.store.provider_policy_cooldowns()
+    };
     let accounts: Vec<Value> = accounts.into_iter().map(|mut account| {
-        let provider = provider_of(&account).to_string();
-        if let Some(entry) = service.store.policy_cooldown_for(&provider, &keys.for_account(&account)) {
-            account["providerCooldown"] = entry;
+        if let Some(limits) = provider_cooldowns.as_ref().and_then(|state| state.get(provider_of(&account))) {
+            use crate::server::core::account_store::policy_cooldowns::active_provider_cooldown;
+            if let Some(entry) = active_provider_cooldown(limits, &keys.for_account(&account), logging::now_ms()) {
+                account["providerCooldown"] = entry.clone();
+            }
         }
         account
     }).filter(|account| {
